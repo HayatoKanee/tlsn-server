@@ -5,9 +5,8 @@ notarization:
   max_sent_data: 4096
   max_recv_data: 16384
   timeout: 120
-  # Path to secp256k1 private key in PEM (PKCS8) format.
-  # Set to null or omit to generate an ephemeral key on startup.
-  # private_key_pem_path: "/path/to/notary.pem"
+  # Path to secp256k1 private key (raw hex or PKCS8 PEM).
+  private_key_pem_path: "/etc/tlsn-server/notary.key"
 
 tls:
   enabled: false

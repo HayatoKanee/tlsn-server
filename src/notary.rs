@@ -123,10 +123,21 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
 
     info!("Waiting for AttestationRequest from prover");
 
-    // Receive AttestationRequest from the prover.
-    let mut request_bytes = Vec::new();
+    // Receive AttestationRequest from the prover (length-prefixed).
+    // The prover sends [8 bytes: u64 LE length][payload] because WebSocket
+    // close is bidirectional — we can't rely on EOF to delimit the request.
+    let mut len_buf = [0u8; 8];
     socket
-        .read_to_end(&mut request_bytes)
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| eyre!("Failed to read request length: {}", e))?;
+    let req_len = u64::from_le_bytes(len_buf) as usize;
+
+    info!("Reading AttestationRequest ({} bytes)", req_len);
+
+    let mut request_bytes = vec![0u8; req_len];
+    socket
+        .read_exact(&mut request_bytes)
         .await
         .map_err(|e| eyre!("Failed to read attestation request: {}", e))?;
 
@@ -166,10 +177,17 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
 
     info!("Attestation built and signed, sending to prover");
 
-    // Send the attestation back to the prover.
+    // Send the attestation back to the prover (length-prefixed).
     let attestation_bytes = bincode::serialize(&attestation)
         .map_err(|e| eyre!("Failed to serialize attestation: {}", e))?;
 
+    info!("Sending attestation ({} bytes)", attestation_bytes.len());
+
+    let len_bytes = (attestation_bytes.len() as u64).to_le_bytes();
+    socket
+        .write_all(&len_bytes)
+        .await
+        .map_err(|e| eyre!("Failed to send attestation length: {}", e))?;
     socket
         .write_all(&attestation_bytes)
         .await
