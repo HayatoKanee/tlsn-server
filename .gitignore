@@ -1,0 +1,22 @@
+# Build artifacts
+/target/
+
+# Vendored repos (used for local dev reference only)
+/tlsn/
+/tlsn-extension/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment / secrets
+.env
+*.pem
+*.key
+
+# OS
+Thumbs.db

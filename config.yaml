@@ -1,0 +1,15 @@
+host: "0.0.0.0"
+port: 7047
+
+notarization:
+  max_sent_data: 4096
+  max_recv_data: 16384
+  timeout: 120
+  # Path to secp256k1 private key in PEM (PKCS8) format.
+  # Set to null or omit to generate an ephemeral key on startup.
+  # private_key_pem_path: "/path/to/notary.pem"
+
+tls:
+  enabled: false
+  # private_key_path: "/path/to/key.pem"
+  # certificate_path: "/path/to/cert.pem"
