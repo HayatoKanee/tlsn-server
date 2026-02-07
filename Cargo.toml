@@ -19,6 +19,7 @@ tlsn = { git = "https://github.com/tlsnotary/tlsn.git", tag = "v0.1.0-alpha.14",
 
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 axum-core = "0.4"
 http = "1.0"
 hyper = "1.0"

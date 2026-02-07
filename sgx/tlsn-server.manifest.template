@@ -1,0 +1,49 @@
+loader.entrypoint = "file:{{ gramine.libos }}"
+libos.entrypoint = "/gramine-ratls"
+
+loader.argv = [
+  "gramine-ratls",
+  "/tmp/crt.pem",
+  "/tmp/key.pem",
+  "--",
+  "tlsn-server",
+  "--config", "/app/config-sgx.yaml",
+]
+
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}"
+loader.env.RUST_BACKTRACE = "full"
+loader.env.RUST_LOG = "info"
+loader.log_level = "{{ log_level }}"
+
+fs.mounts = [
+  { path = "/gramine-ratls", uri = "file:{{ entrypoint }}" },
+  { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
+  { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}" },
+  { path = "/tmp", type = "tmpfs" },
+]
+
+sgx.debug = false
+sgx.edmm_enable = true
+sgx.remote_attestation = "dcap"
+sgx.max_threads = 32
+sgx.enclave_size = "512M"
+
+sgx.trusted_files = [
+  "file:{{ gramine.libos }}",
+  "file:{{ entrypoint }}",
+  "file:tlsn-server",
+  "file:{{ gramine.runtimedir() }}/",
+  "file:{{ arch_libdir }}/",
+  "file:/app/config-sgx.yaml",
+  "file:/app/notary.key",
+  "file:/etc/ssl/certs/ca-certificates.crt",
+]
+
+sgx.allowed_files = [
+  "file:/etc/nsswitch.conf",
+  "file:/etc/hosts",
+  "file:/etc/resolv.conf",
+]
+
+sys.enable_sigterm_injection = true
+sys.insecure__allow_eventfd = true

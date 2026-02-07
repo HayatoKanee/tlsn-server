@@ -12,7 +12,6 @@ pub struct Config {
     pub port: u16,
     #[serde(default)]
     pub notarization: NotarizationConfig,
-    #[allow(dead_code)]
     #[serde(default)]
     pub tls: TlsConfig,
 }
@@ -33,7 +32,6 @@ pub struct NotarizationConfig {
     pub private_key_pem_path: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsConfig {
     #[serde(default)]

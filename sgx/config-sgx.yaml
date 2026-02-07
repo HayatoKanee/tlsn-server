@@ -1,0 +1,13 @@
+host: "0.0.0.0"
+port: 7047
+
+notarization:
+  max_sent_data: 4096
+  max_recv_data: 16384
+  timeout: 120
+  private_key_pem_path: "/app/notary.key"
+
+tls:
+  enabled: true
+  certificate_path: "/tmp/crt.pem"     # Written by gramine-ratls at enclave startup
+  private_key_path: "/tmp/key.pem"     # Written by gramine-ratls at enclave startup

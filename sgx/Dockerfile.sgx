@@ -1,0 +1,100 @@
+# ==============================================================================
+# Stage 1: Build the Rust binary
+# ==============================================================================
+FROM rust:latest AS builder
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+RUN cargo build --release
+
+# ==============================================================================
+# Stage 2: Create Gramine manifest and sign the enclave
+# ==============================================================================
+FROM ubuntu:22.04 AS gramine-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Gramine from official repo
+RUN apt-get update && apt-get install -y \
+    curl \
+    gnupg2 \
+    software-properties-common \
+    && curl -fsSLo /usr/share/keyrings/gramine-keyring.gpg https://packages.gramineproject.io/gramine-keyring.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gramine-keyring.gpg] https://packages.gramineproject.io/ jammy main" \
+       > /etc/apt/sources.list.d/gramine.list \
+    && apt-get update && apt-get install -y \
+    gramine \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the built binary
+COPY --from=builder /app/target/release/tlsn-server .
+
+# Copy SGX manifest template and config
+COPY sgx/tlsn-server.manifest.template .
+COPY sgx/config-sgx.yaml .
+COPY notary.key .
+
+# Generate the signing key for Gramine (enclave signing)
+RUN gramine-sgx-gen-private-key
+
+# Build the manifest and sign the enclave
+RUN gramine-manifest \
+    -Dlog_level=warning \
+    -Dentrypoint=$(which gramine-ratls) \
+    -Darch_libdir=/lib/x86_64-linux-gnu \
+    tlsn-server.manifest.template \
+    tlsn-server.manifest \
+    && gramine-sgx-sign --manifest tlsn-server.manifest --output tlsn-server.manifest.sgx
+
+# ==============================================================================
+# Stage 3: Runtime image with SGX support
+# ==============================================================================
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Gramine + Intel SGX DCAP libraries + Azure DCAP client
+RUN apt-get update && apt-get install -y \
+    curl \
+    gnupg2 \
+    software-properties-common \
+    ca-certificates \
+    && curl -fsSLo /usr/share/keyrings/gramine-keyring.gpg https://packages.gramineproject.io/gramine-keyring.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/gramine-keyring.gpg] https://packages.gramineproject.io/ jammy main" \
+       > /etc/apt/sources.list.d/gramine.list \
+    # Intel SGX repo
+    && curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key | apt-key add - \
+    && echo "deb https://download.01.org/intel-sgx/sgx_repo/ubuntu jammy main" \
+       > /etc/apt/sources.list.d/intel-sgx.list \
+    # Microsoft Azure DCAP repo
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+    && echo "deb https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+       > /etc/apt/sources.list.d/msprod.list \
+    && apt-get update && apt-get install -y \
+    gramine \
+    libsgx-dcap-ql \
+    libsgx-dcap-default-qpl \
+    az-dcap-client \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy Gramine artifacts from the builder
+COPY --from=gramine-builder /app/tlsn-server /app/
+COPY --from=gramine-builder /app/tlsn-server.manifest /app/
+COPY --from=gramine-builder /app/tlsn-server.manifest.sgx /app/
+COPY --from=gramine-builder /app/tlsn-server.sig /app/
+
+# Copy config and notary key
+COPY sgx/config-sgx.yaml /app/config-sgx.yaml
+COPY notary.key /app/notary.key
+
+# Copy Azure PCCS configuration for DCAP attestation
+COPY sgx/sgx_default_qcnl.conf /etc/sgx_default_qcnl.conf
+
+EXPOSE 7047
+
+ENTRYPOINT ["gramine-sgx", "tlsn-server"]

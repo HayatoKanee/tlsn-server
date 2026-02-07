@@ -17,6 +17,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use axum_websocket::{WebSocket, WebSocketUpgrade};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -132,6 +133,8 @@ async fn main() -> eyre::Result<()> {
         notary_key,
     });
 
+    let tls_config = app_state.config.tls.clone();
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/info", get(info_handler))
@@ -141,15 +144,36 @@ async fn main() -> eyre::Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
-    info!("TLSNotary Notary Server starting on {}", addr);
+    let tls_enabled = tls_config.enabled;
+    info!(
+        "TLSNotary Notary Server starting on {} (TLS: {})",
+        addr,
+        if tls_enabled { "enabled" } else { "disabled" }
+    );
     info!("  GET  /health              - Health check");
     info!("  GET  /info                - Server info + public key");
     info!("  POST /session             - Create notarization session");
     info!("  GET  /notarize?sessionId= - WebSocket notarization");
     info!("  GET  /proxy?token=        - WebSocket-to-TCP proxy");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).tcp_nodelay(true).await?;
+    if tls_enabled {
+        let cert_path = tls_config
+            .certificate_path
+            .as_ref()
+            .expect("tls.certificate_path is required when tls.enabled = true");
+        let key_path = tls_config
+            .private_key_path
+            .as_ref()
+            .expect("tls.private_key_path is required when tls.enabled = true");
+
+        let rustls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+        axum_server::bind_rustls(addr, rustls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app).tcp_nodelay(true).await?;
+    }
 
     Ok(())
 }

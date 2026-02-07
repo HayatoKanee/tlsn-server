@@ -18,5 +18,8 @@
 *.pem
 *.key
 
+# Tooling
+.serena/
+
 # OS
 Thumbs.db
