@@ -11,15 +11,23 @@ pub struct NotaryKey {
 
 /// Create a NotaryKey with crypto provider and extracted public key.
 ///
-/// If `pem_path` is Some, loads a secp256k1 key from a PEM or hex file.
-/// If None, generates a random ephemeral key (suitable for development).
+/// Key resolution order:
+/// 1. `NOTARY_SIGNING_KEY` env var (raw 64-char hex private key)
+/// 2. `pem_path` config (file path to PEM or hex key file)
+/// 3. Ephemeral random key (development only)
 pub fn create_notary_key(pem_path: Option<&str>) -> Result<NotaryKey> {
-    let signing_key = match pem_path {
-        Some(path) => load_signing_key(path)?,
-        None => {
-            info!("No signing key configured, generating ephemeral key");
-            SigningKey::random(&mut rand::thread_rng())
-        }
+    let signing_key = if let Ok(hex_key) = std::env::var("NOTARY_SIGNING_KEY") {
+        let hex_key = hex_key.trim();
+        let key_bytes =
+            hex::decode(hex_key).map_err(|e| eyre!("NOTARY_SIGNING_KEY invalid hex: {}", e))?;
+        info!("Using signing key from NOTARY_SIGNING_KEY env var");
+        SigningKey::from_slice(&key_bytes)
+            .map_err(|e| eyre!("NOTARY_SIGNING_KEY invalid secp256k1 key: {}", e))?
+    } else if let Some(path) = pem_path {
+        load_signing_key(path)?
+    } else {
+        info!("No signing key configured, generating ephemeral key");
+        SigningKey::random(&mut rand::thread_rng())
     };
 
     let public_key = signing_key.verifying_key().to_sec1_bytes().to_vec();
