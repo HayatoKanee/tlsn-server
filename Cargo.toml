@@ -35,7 +35,7 @@ futures-util = "0.3"
 async-trait = "0.1"
 
 # Cryptography
-k256 = "0.13"
+k256 = { version = "0.13", features = ["pkcs8"] }
 rand = "0.8"
 sha1 = "0.10"
 base64 = "0.22"

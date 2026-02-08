@@ -1,6 +1,8 @@
 # tlsn-server
 
-A standalone TLSNotary Notary Server for **alpha 14**.
+A standalone [TLSNotary](https://tlsnotary.org/) Notary Server for **alpha 14**.
+
+Built on [tlsnotary/tlsn](https://github.com/tlsnotary/tlsn) `v0.1.0-alpha.14`.
 
 TLSNotary removed the `notary-server` crate in alpha 13 and archived `tlsn-js`. This project provides a lightweight notary server that implements the MPC-TLS co-computation and attestation signing protocol.
 
@@ -92,6 +94,34 @@ tls:
 ```
 
 ## Docker
+
+### Pre-built image (Docker Hub)
+
+```bash
+docker pull lumio1/tlsn-server:v0.1.0-alpha.14
+docker run -p 7047:7047 lumio1/tlsn-server:v0.1.0-alpha.14
+```
+
+With a custom config:
+
+```bash
+docker run -p 7047:7047 \
+  -v $(pwd)/config.yaml:/app/config.yaml \
+  lumio1/tlsn-server:v0.1.0-alpha.14 \
+  --config /app/config.yaml
+```
+
+With a persistent signing key:
+
+```bash
+docker run -p 7047:7047 \
+  -v $(pwd)/notary.pem:/app/notary.pem \
+  -v $(pwd)/config.yaml:/app/config.yaml \
+  lumio1/tlsn-server:v0.1.0-alpha.14 \
+  --config /app/config.yaml
+```
+
+### Build from source
 
 ```bash
 docker build -t tlsn-server .

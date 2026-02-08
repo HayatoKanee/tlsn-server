@@ -72,16 +72,10 @@ fn load_signing_key(path: &str) -> Result<SigningKey> {
         .decode(&base64_content)
         .map_err(|e| eyre!("Failed to decode PEM base64: {}", e))?;
 
-    // Try SEC1 DER, then try extracting raw key bytes from PKCS8.
+    // Try SEC1 DER first, then PKCS8 DER.
+    use k256::pkcs8::DecodePrivateKey;
     k256::SecretKey::from_sec1_der(&der_bytes)
-        .or_else(|_| {
-            if der_bytes.len() >= 32 {
-                let key_bytes = &der_bytes[der_bytes.len() - 32..];
-                k256::SecretKey::from_slice(key_bytes)
-            } else {
-                Err(k256::elliptic_curve::Error)
-            }
-        })
+        .or_else(|_| k256::SecretKey::from_pkcs8_der(&der_bytes))
         .map(|sk| SigningKey::from(&sk))
-        .map_err(|e| eyre!("Failed to parse key file: {}", e))
+        .map_err(|e| eyre!("Failed to parse key file (tried SEC1 and PKCS8): {}", e))
 }
