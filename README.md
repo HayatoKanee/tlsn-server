@@ -130,11 +130,33 @@ docker run -p 7047:7047 tlsn-server
 
 ## Signing Key
 
-By default, an ephemeral secp256k1 key is generated on startup. For production, provide a persistent key:
+By default, an ephemeral secp256k1 key is generated on startup. For production, provide a persistent key using one of these methods (checked in order):
 
-1. Generate a key: `openssl ecparam -name secp256k1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out notary.pem`
-2. Set `notarization.private_key_pem_path: "/path/to/notary.pem"` in config
-3. The public key is exposed via `/info` for provers to verify attestations
+### Option 1: Environment variable (recommended for containers)
+
+```bash
+# Generate a raw hex private key
+openssl ecparam -name secp256k1 -genkey -noout | openssl ec -text -noout 2>/dev/null | grep -A3 'priv:' | tail -3 | tr -d ' :\n'
+
+# Pass it as NOTARY_SIGNING_KEY
+docker run -p 7047:7047 -e NOTARY_SIGNING_KEY=<64-char-hex> lumio1/tlsn-server:v0.1.0-alpha.14
+```
+
+### Option 2: PEM file
+
+```bash
+# Generate a PKCS8 PEM key
+openssl ecparam -name secp256k1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out notary.pem
+
+# Reference it in config.yaml
+# notarization.private_key_pem_path: "/path/to/notary.pem"
+```
+
+### Option 3: Raw hex file
+
+Save a 64-character hex private key to a file and reference it via `private_key_pem_path` in config.
+
+The public key is exposed via `/info` for provers to verify attestations.
 
 ## Testing
 
