@@ -7,37 +7,49 @@ use tlsn::{
         request::Request as AttestationRequest, Attestation, AttestationConfig, CryptoProvider,
     },
     config::verifier::VerifierConfig,
-    connection::{ConnectionInfo, TranscriptLength},
-    transcript::ContentType,
+    connection::{ConnectionInfo, ServerName, TranscriptLength},
+    transcript::{ContentType, TranscriptCommitment, TlsTranscript},
     verifier::VerifierOutput,
     Session,
 };
 
-/// Run the notarization protocol on the given socket.
-///
-/// This function acts as the notary (verifier) side of the MPC-TLS protocol:
-/// 1. Creates a session with the prover
-/// 2. Runs the verifier protocol (MPC-TLS co-computation)
-/// 3. Receives an AttestationRequest from the prover
-/// 4. Signs and returns an Attestation
-pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
-    socket: S,
-    crypto_provider: &CryptoProvider,
-    verifier_config: VerifierConfig,
-) -> Result<()> {
-    info!("Starting notarization session");
+use crate::settlement::{batch, oracle, EscrowSnapshot, OracleWallet, SettlementResult};
 
-    // Create a session with the prover.
-    // Session::new takes futures::io::AsyncRead + AsyncWrite.
+/// Maximum allowed message size for length-prefixed reads from the prover (16 MiB).
+/// Prevents a malicious prover from claiming a multi-GB length and causing OOM.
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+// ============================================================================
+// MPC-TLS Result
+// ============================================================================
+
+/// Bundles MPC-TLS output needed by both attestation and settlement.
+pub struct MpcTlsResult {
+    pub server_name: Option<ServerName>,
+    pub sent_bytes: Vec<u8>,
+    pub recv_bytes: Vec<u8>,
+    pub transcript_commitments: Vec<TranscriptCommitment>,
+    pub tls_transcript: TlsTranscript,
+}
+
+// ============================================================================
+// Step 1: Run MPC-TLS Protocol
+// ============================================================================
+
+/// Run MPC-TLS, extract plaintext, return result + reclaimed socket.
+pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
+    socket: S,
+    verifier_config: VerifierConfig,
+) -> Result<(MpcTlsResult, S)> {
+    info!("Starting MPC-TLS session");
+
     let session = Session::new(socket);
     let (driver, mut handle) = session.split();
 
-    // Spawn the session driver to run in the background.
     let driver_task = tokio::spawn(driver);
 
     info!("Running MPC-TLS verifier protocol");
 
-    // Create verifier and run the commitment protocol.
     let verifier = handle
         .new_verifier(verifier_config)
         .map_err(|e| eyre!("Failed to create verifier: {}", e))?
@@ -45,13 +57,11 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         .await
         .map_err(|e| eyre!("Commitment failed: {}", e))?;
 
-    // Accept the prover's commitment request.
     let verifier = verifier
         .accept()
         .await
         .map_err(|e| eyre!("Accept failed: {}", e))?;
 
-    // Run the MPC-TLS protocol.
     let verifier = verifier
         .run()
         .await
@@ -59,7 +69,6 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
 
     info!("MPC-TLS protocol complete, verifying transcript");
 
-    // Verify the proof.
     let verifier = verifier
         .verify()
         .await
@@ -68,6 +77,8 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     let (
         VerifierOutput {
             transcript_commitments,
+            server_name,
+            transcript,
             ..
         },
         verifier,
@@ -78,13 +89,13 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
 
     let tls_transcript = verifier.tls_transcript().clone();
 
-    // Close the verifier.
-    verifier
-        .close()
-        .await
-        .map_err(|e| eyre!("Failed to close verifier: {}", e))?;
+    // Extract plaintext from transcript (for settlement)
+    let (sent_bytes, recv_bytes) = match transcript {
+        Some(ref t) => (t.sent_unsafe().to_vec(), t.received_unsafe().to_vec()),
+        None => (Vec::new(), Vec::new()),
+    };
 
-    // Compute transcript lengths (application data only).
+    // Log transcript lengths
     let sent_len = tls_transcript
         .sent()
         .iter()
@@ -110,28 +121,65 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         .sum::<usize>();
 
     info!(
-        "Transcript: sent={} bytes, recv={} bytes",
-        sent_len, recv_len
+        "Transcript: sent={} bytes, recv={} bytes, plaintext_sent={}, plaintext_recv={}",
+        sent_len, recv_len, sent_bytes.len(), recv_bytes.len()
     );
 
-    // Close the session and reclaim the socket.
+    if let Some(ref name) = server_name {
+        info!("Server name: {:?}", name);
+    }
+
+    // Close verifier
+    verifier
+        .close()
+        .await
+        .map_err(|e| eyre!("Failed to close verifier: {}", e))?;
+
+    // Close session and reclaim socket
     handle.close();
-    let mut socket = driver_task
+    let socket = driver_task
         .await
         .map_err(|e| eyre!("Driver task failed: {}", e))?
         .map_err(|e| eyre!("Session driver error: {}", e))?;
 
+    let result = MpcTlsResult {
+        server_name,
+        sent_bytes,
+        recv_bytes,
+        transcript_commitments,
+        tls_transcript,
+    };
+
+    Ok((result, socket))
+}
+
+// ============================================================================
+// Step 2: Attestation Exchange (always runs, unchanged logic)
+// ============================================================================
+
+/// Exchange attestation request/response with the prover.
+pub async fn handle_attestation<S: AsyncRead + AsyncWrite + Unpin>(
+    mpc: &MpcTlsResult,
+    socket: &mut S,
+    crypto_provider: &CryptoProvider,
+) -> Result<()> {
     info!("Waiting for AttestationRequest from prover");
 
-    // Receive AttestationRequest from the prover (length-prefixed).
-    // The prover sends [8 bytes: u64 LE length][payload] because WebSocket
-    // close is bidirectional — we can't rely on EOF to delimit the request.
+    // Receive AttestationRequest (length-prefixed)
     let mut len_buf = [0u8; 8];
     socket
         .read_exact(&mut len_buf)
         .await
         .map_err(|e| eyre!("Failed to read request length: {}", e))?;
     let req_len = u64::from_le_bytes(len_buf) as usize;
+
+    if req_len > MAX_MESSAGE_SIZE {
+        return Err(eyre!(
+            "AttestationRequest too large: {} bytes (max {})",
+            req_len,
+            MAX_MESSAGE_SIZE
+        ));
+    }
 
     info!("Reading AttestationRequest ({} bytes)", req_len);
 
@@ -146,7 +194,7 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
 
     info!("Received AttestationRequest, building Attestation");
 
-    // Build attestation config.
+    // Build attestation
     let mut att_config_builder = AttestationConfig::builder();
     att_config_builder
         .supported_signature_algs(Vec::from_iter(crypto_provider.signer.supported_algs()));
@@ -154,22 +202,48 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         .build()
         .map_err(|e| eyre!("Failed to build attestation config: {}", e))?;
 
-    // Build the attestation.
+    // Compute transcript lengths
+    let sent_len = mpc
+        .tls_transcript
+        .sent()
+        .iter()
+        .filter_map(|record| {
+            if let ContentType::ApplicationData = record.typ {
+                Some(record.ciphertext.len())
+            } else {
+                None
+            }
+        })
+        .sum::<usize>();
+
+    let recv_len = mpc
+        .tls_transcript
+        .recv()
+        .iter()
+        .filter_map(|record| {
+            if let ContentType::ApplicationData = record.typ {
+                Some(record.ciphertext.len())
+            } else {
+                None
+            }
+        })
+        .sum::<usize>();
+
     let mut builder = Attestation::builder(&att_config)
         .accept_request(request)
         .map_err(|e| eyre!("Failed to accept attestation request: {}", e))?;
 
     builder
         .connection_info(ConnectionInfo {
-            time: tls_transcript.time(),
-            version: *tls_transcript.version(),
+            time: mpc.tls_transcript.time(),
+            version: *mpc.tls_transcript.version(),
             transcript_length: TranscriptLength {
                 sent: sent_len as u32,
                 received: recv_len as u32,
             },
         })
-        .server_ephemeral_key(tls_transcript.server_ephemeral_key().clone())
-        .transcript_commitments(transcript_commitments);
+        .server_ephemeral_key(mpc.tls_transcript.server_ephemeral_key().clone())
+        .transcript_commitments(mpc.transcript_commitments.clone());
 
     let attestation = builder
         .build(crypto_provider)
@@ -177,7 +251,7 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
 
     info!("Attestation built and signed, sending to prover");
 
-    // Send the attestation back to the prover (length-prefixed).
+    // Send attestation (length-prefixed)
     let attestation_bytes = bincode::serialize(&attestation)
         .map_err(|e| eyre!("Failed to serialize attestation: {}", e))?;
 
@@ -193,12 +267,81 @@ pub async fn notarize<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         .await
         .map_err(|e| eyre!("Failed to send attestation: {}", e))?;
 
-    socket
-        .close()
-        .await
-        .map_err(|e| eyre!("Failed to close socket: {}", e))?;
+    info!("Attestation sent successfully");
 
-    info!("Notarization session completed successfully");
+    Ok(())
+}
+
+// ============================================================================
+// Step 3: Settlement (decide + on-chain + send result to prover)
+// ============================================================================
+
+/// Settle on-chain and send result to prover.
+pub async fn handle_settlement<S: AsyncRead + AsyncWrite + Unpin>(
+    mpc: &MpcTlsResult,
+    socket: &mut S,
+    escrow: &EscrowSnapshot,
+    wallet: &OracleWallet,
+) -> Result<()> {
+    let server_name_str = mpc
+        .server_name
+        .as_ref()
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+
+    info!("Starting settlement for asset_id={}", escrow.asset_id);
+
+    // 1. Decide: parse plaintext + validate against escrow
+    let settlement_result = oracle::decide(
+        &server_name_str,
+        &mpc.sent_bytes,
+        &mpc.recv_bytes,
+        escrow,
+    )
+    .map_err(|e| eyre!("Settlement decision failed: {e}"))?;
+
+    info!(
+        "Settlement decision: asset_id={}, decision={:?}, refund_reason={:?}",
+        settlement_result.asset_id, settlement_result.decision, settlement_result.refund_reason
+    );
+
+    // 2. Compute batch_hash (single settlement: batch_hash = commitment)
+    let commitment = escrow.commitment();
+    let batch_hash = batch::compute_batch_hash(&[commitment]);
+
+    // 3. Submit on-chain
+    let tx_hash = wallet
+        .settle_on_chain(batch_hash, &[settlement_result.clone()])
+        .await
+        .map_err(|e| eyre!("On-chain settlement failed: {e}"))?;
+
+    info!("Settlement tx confirmed: {tx_hash}");
+
+    // 4. Build wire result and send to prover
+    let wire_result = SettlementResult {
+        tx_hash: tx_hash.0,
+        asset_id: settlement_result.asset_id,
+        decision: settlement_result.decision as u8,
+        refund_reason: settlement_result.refund_reason as u8,
+    };
+
+    let result_bytes = bincode::serialize(&wire_result)
+        .map_err(|e| eyre!("Failed to serialize settlement result: {e}"))?;
+
+    info!("Sending settlement result ({} bytes)", result_bytes.len());
+
+    // Send length-prefixed result
+    let len_bytes = (result_bytes.len() as u64).to_le_bytes();
+    socket
+        .write_all(&len_bytes)
+        .await
+        .map_err(|e| eyre!("Failed to send settlement result length: {e}"))?;
+    socket
+        .write_all(&result_bytes)
+        .await
+        .map_err(|e| eyre!("Failed to send settlement result: {e}"))?;
+
+    info!("Settlement complete: asset_id={}, tx={tx_hash}", escrow.asset_id);
 
     Ok(())
 }

@@ -65,10 +65,17 @@ async fn test_full_notarization_round_trip() {
     // 4. Create duplex pair for prover <-> notary communication.
     let (prover_socket, notary_socket) = tokio::io::duplex(1 << 23);
 
-    // 5. Spawn notary task using our server's notarize function.
+    // 5. Spawn notary task using run_mpc_tls + handle_attestation.
     let crypto_provider = notary_key.provider;
     tokio::spawn(async move {
-        tlsn_server::notary::notarize(notary_socket.compat(), &crypto_provider, verifier_config)
+        let (mpc, mut socket) =
+            tlsn_server::notary::run_mpc_tls(notary_socket.compat(), verifier_config)
+                .await
+                .unwrap();
+        tlsn_server::notary::handle_attestation(&mpc, &mut socket, &crypto_provider)
+            .await
+            .unwrap();
+        futures_util::io::AsyncWriteExt::close(&mut socket)
             .await
             .unwrap();
     });
@@ -195,17 +202,22 @@ async fn test_full_notarization_round_trip() {
 
     let (request, _secrets) = builder.build(&CryptoProvider::default()).unwrap();
 
-    // Close session, reclaim socket, send request to notary.
+    // Close session, reclaim socket, send request to notary (length-prefixed).
     handle.close();
     let mut socket = driver_task.await.unwrap().unwrap();
 
     let request_bytes = bincode::serialize(&request).unwrap();
+    let len_bytes = (request_bytes.len() as u64).to_le_bytes();
+    socket.write_all(&len_bytes).await.unwrap();
     socket.write_all(&request_bytes).await.unwrap();
-    socket.close().await.unwrap();
 
-    // Receive attestation from notary.
-    let mut attestation_bytes = Vec::new();
-    socket.read_to_end(&mut attestation_bytes).await.unwrap();
+    // Receive attestation from notary (length-prefixed).
+    let mut len_buf = [0u8; 8];
+    socket.read_exact(&mut len_buf).await.unwrap();
+    let att_len = u64::from_le_bytes(len_buf) as usize;
+
+    let mut attestation_bytes = vec![0u8; att_len];
+    socket.read_exact(&mut attestation_bytes).await.unwrap();
     let attestation: Attestation = bincode::deserialize(&attestation_bytes).unwrap();
 
     // 7. Validate attestation against prover's view.

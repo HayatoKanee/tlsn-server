@@ -14,6 +14,8 @@ pub struct Config {
     pub notarization: NotarizationConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub oracle: OracleConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +42,23 @@ pub struct TlsConfig {
     pub certificate_path: Option<String>,
 }
 
+/// Oracle settlement configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OracleConfig {
+    /// Enable oracle settlement mode.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to oracle Ethereum private key (hex format).
+    pub signing_key_path: Option<String>,
+    /// Ethereum RPC URL (e.g. Arbitrum).
+    pub rpc_url: Option<String>,
+    /// JJSKIN contract address.
+    pub contract_address: Option<String>,
+    /// Chain ID (default: 42161 for Arbitrum One).
+    #[serde(default = "default_chain_id")]
+    pub chain_id: u64,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -47,6 +66,7 @@ impl Default for Config {
             port: default_port(),
             notarization: NotarizationConfig::default(),
             tls: TlsConfig::default(),
+            oracle: OracleConfig::default(),
         }
     }
 }
@@ -68,6 +88,18 @@ impl Default for TlsConfig {
             enabled: false,
             private_key_path: None,
             certificate_path: None,
+        }
+    }
+}
+
+impl Default for OracleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            signing_key_path: None,
+            rpc_url: None,
+            contract_address: None,
+            chain_id: default_chain_id(),
         }
     }
 }
@@ -113,4 +145,8 @@ fn default_max_recv_data() -> usize {
 
 fn default_timeout() -> u64 {
     120
+}
+
+fn default_chain_id() -> u64 {
+    42161 // Arbitrum One
 }
