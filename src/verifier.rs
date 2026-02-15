@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use eyre::{Result, eyre};
 use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tracing::info;
@@ -40,31 +42,46 @@ pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     let driver_task = tokio::spawn(driver);
 
     info!("Running MPC-TLS verifier protocol");
+    let total_start = Instant::now();
 
+    // Step 1: Create verifier + OT setup (commit)
+    let t0 = Instant::now();
     let verifier = handle
         .new_verifier(verifier_config)
         .map_err(|e| eyre!("Failed to create verifier: {}", e))?
         .commit()
         .await
         .map_err(|e| eyre!("Commitment failed: {}", e))?;
+    info!("[TIMING] commit (OT setup): {:?}", t0.elapsed());
 
+    // Step 2: Accept (prover ready)
+    let t1 = Instant::now();
     let verifier = verifier
         .accept()
         .await
         .map_err(|e| eyre!("Accept failed: {}", e))?;
+    info!("[TIMING] accept: {:?}", t1.elapsed());
 
+    // Step 3: Run MPC-TLS (garbled circuits over TLS)
+    let t2 = Instant::now();
     let verifier = verifier
         .run()
         .await
         .map_err(|e| eyre!("MPC-TLS run failed: {}", e))?;
+    info!("[TIMING] run (MPC-TLS): {:?}", t2.elapsed());
 
     info!("MPC-TLS protocol complete, verifying transcript");
 
+    // Step 4: Verify transcript
+    let t3 = Instant::now();
     let verifier = verifier
         .verify()
         .await
         .map_err(|e| eyre!("Verification failed: {}", e))?;
+    info!("[TIMING] verify: {:?}", t3.elapsed());
 
+    // Step 5: Accept verification output
+    let t4 = Instant::now();
     let (
         VerifierOutput {
             server_name,
@@ -76,6 +93,8 @@ pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         .accept()
         .await
         .map_err(|e| eyre!("Accept verification failed: {}", e))?;
+    info!("[TIMING] accept_verification: {:?}", t4.elapsed());
+    info!("[TIMING] total MPC-TLS: {:?}", total_start.elapsed());
 
     let tls_transcript = verifier.tls_transcript();
 
@@ -117,6 +136,7 @@ pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     }
 
     // Close verifier
+    let t5 = Instant::now();
     verifier
         .close()
         .await
@@ -128,6 +148,7 @@ pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         .await
         .map_err(|e| eyre!("Driver task failed: {}", e))?
         .map_err(|e| eyre!("Session driver error: {}", e))?;
+    info!("[TIMING] close + reclaim socket: {:?}", t5.elapsed());
 
     let result = MpcTlsResult {
         server_name,
@@ -168,18 +189,22 @@ pub async fn handle_post_protocol<S: AsyncRead + AsyncWrite + Unpin>(
         mpc.recv_bytes.len()
     );
 
+    let t_decide = Instant::now();
     let settlement = oracle::decide(&server_name_str, &mpc.sent_bytes, &mpc.recv_bytes, escrow)
         .map_err(|e| eyre!("Settlement decision failed: {e}"))?;
+    info!("[TIMING] oracle::decide: {:?}", t_decide.elapsed());
 
     info!(
         "Decision: asset_id={}, decision={:?}, refund_reason={:?}",
         settlement.asset_id, settlement.decision, settlement.refund_reason
     );
 
+    let t_sign = Instant::now();
     let signature = signer
         .sign_settlement(&settlement)
         .await
         .map_err(|e| eyre!("EIP-712 signing failed: {e}"))?;
+    info!("[TIMING] EIP-712 sign: {:?}", t_sign.elapsed());
 
     info!(
         "Signed settlement: sig=0x{}",

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Query, State},
@@ -367,14 +367,17 @@ async fn handle_notarize_websocket(
 
         // Step 2: Read escrow from on-chain (trustless source)
         info!("[{}] Reading escrow from chain for asset_id={}", session_id, session_data.asset_id);
+        let t_chain = Instant::now();
         let escrow = state
             .chain_reader
             .read_escrow(session_data.asset_id)
             .await
             .map_err(|e| eyre::eyre!("Chain read failed: {e}"))?;
+        info!("[{}] [TIMING] chain read: {:?}", session_id, t_chain.elapsed());
 
         // Step 3: Settlement — use MPC-verified plaintext + on-chain escrow, sign EIP-712
         info!("[{}] Running oracle settlement", session_id);
+        let t_settle = Instant::now();
 
         verifier::handle_post_protocol(
             &mpc,
@@ -383,6 +386,7 @@ async fn handle_notarize_websocket(
             &state.oracle_signer,
         )
         .await?;
+        info!("[{}] [TIMING] settlement (decide+sign+send): {:?}", session_id, t_settle.elapsed());
 
         Ok::<(), eyre::Report>(())
     })
