@@ -32,25 +32,41 @@ impl OracleSigner {
     /// Create from OracleConfig.
     ///
     /// Key resolution order:
-    /// 1. `ORACLE_SIGNING_KEY` env var (raw 64-char hex private key)
-    /// 2. `signing_key_path` config (file path to hex key)
-    /// 3. Error (no ephemeral key for oracle — too dangerous)
+    /// 1. Generate a fresh random key (TEE mode — key never leaves enclave)
+    /// 2. `ORACLE_SIGNING_KEY` env var (dev/test mode only — operator knows key)
+    /// 3. `signing_key_path` config (dev/test mode only)
+    ///
+    /// In production SGX, always use the generated key. The key only exists in
+    /// encrypted enclave memory and is bound to the DCAP quote via reportData.
+    /// Each enclave boot produces a fresh key → requires `registerOracle()`.
     pub fn from_config(config: &OracleConfig) -> Result<Self> {
         let signer = if let Ok(hex_key) = std::env::var("ORACLE_SIGNING_KEY") {
+            // Dev/test mode: operator-provided key (NOT for production SGX)
             let hex_key = hex_key.trim();
-            hex_key
+            let s = hex_key
                 .parse::<PrivateKeySigner>()
-                .map_err(|e| eyre!("ORACLE_SIGNING_KEY invalid: {e}"))?
+                .map_err(|e| eyre!("ORACLE_SIGNING_KEY invalid: {e}"))?;
+            info!("Oracle key loaded from env (dev/test mode — NOT SGX-secure)");
+            s
         } else if let Some(path) = &config.signing_key_path {
+            // Dev/test mode: key from file
             let data = std::fs::read_to_string(path)
                 .map_err(|e| eyre!("Failed to read oracle key file '{path}': {e}"))?;
             let data = data.trim();
-            data.parse::<PrivateKeySigner>()
-                .map_err(|e| eyre!("Invalid oracle key in '{path}': {e}"))?
+            let s = data
+                .parse::<PrivateKeySigner>()
+                .map_err(|e| eyre!("Invalid oracle key in '{path}': {e}"))?;
+            info!("Oracle key loaded from file (dev/test mode — NOT SGX-secure)");
+            s
         } else {
-            return Err(eyre!(
-                "Oracle signing key required: set ORACLE_SIGNING_KEY env or oracle.signing_key_path config"
-            ));
+            // Production TEE mode: generate fresh key inside enclave
+            let s = PrivateKeySigner::random();
+            info!(
+                "Oracle key generated inside enclave (address={}). \
+                 Key exists only in enclave memory — register via /attestation quote.",
+                s.address()
+            );
+            s
         };
 
         let contract_address: Address = config

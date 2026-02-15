@@ -8,13 +8,11 @@ notarization:
   private_key_pem_path: "/app/notary.key"
 
 tls:
-  enabled: true
-  certificate_path: "/tmp/crt.pem"     # Written by gramine-ratls at enclave startup
-  private_key_path: "/tmp/key.pem"     # Written by gramine-ratls at enclave startup
+  enabled: false  # Caddy reverse proxy handles HTTPS (Let's Encrypt → localhost:7047)
 
 oracle:
-  # No signing key configured — key is generated inside the enclave at each boot.
-  # The private key never leaves SGX encrypted memory.
+  # No signing key configured — key is generated inside the TDX VM at each boot.
+  # The private key never leaves TDX encrypted memory.
   contract_address: "0xbc2881e3f247F38a4B362bAF21829b17ea141Af1"  # JJSKIN on Arbitrum Sepolia
   chain_id: 421614  # Arbitrum Sepolia
   rpc_url: "https://sepolia-rollup.arbitrum.io/rpc"

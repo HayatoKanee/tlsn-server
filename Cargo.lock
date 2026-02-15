@@ -4438,6 +4438,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c665f33d38cea657d9614f766881e4d510e0eda4239891eea56b4cadcf01801b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5432,8 +5433,10 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "miniz_oxide",
  "reqwest",
+ "rustls 0.23.36",
  "serde",
  "serde_json",
  "serde_yaml",

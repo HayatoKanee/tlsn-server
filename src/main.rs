@@ -1,3 +1,4 @@
+mod attestation;
 mod axum_websocket;
 mod config;
 mod proxy;
@@ -92,6 +93,10 @@ struct InfoResponse {
     git_hash: String,
     #[serde(rename = "oracleAddress")]
     oracle_address: String,
+    #[serde(rename = "tdxEnabled")]
+    tdx_enabled: bool,
+    #[serde(rename = "tdxBackend")]
+    tdx_backend: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +111,11 @@ struct NotarizeQuery {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    // Install ring crypto provider before any rustls usage
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt()
         .with_target(true)
         .with_max_level(tracing::Level::INFO)
@@ -148,6 +158,9 @@ async fn main() -> eyre::Result<()> {
         config.oracle.rpc_url, config.oracle.contract_address, config.oracle.steam_factory_address
     );
 
+    // Bind oracle address for TDX attestation (no-op outside TDX).
+    attestation::bind_oracle_address(oracle_signer.address());
+
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .expect("Invalid host:port");
@@ -164,6 +177,7 @@ async fn main() -> eyre::Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/info", get(info_handler))
+        .route("/attestation", get(attestation::attestation_handler))
         .route("/session", post(session_handler))
         .route("/notarize", get(notarize_ws_handler))
         .route("/proxy", get(proxy::proxy_ws_handler))
@@ -178,6 +192,7 @@ async fn main() -> eyre::Result<()> {
     );
     info!("  GET  /health              - Health check");
     info!("  GET  /info                - Server info + oracle address");
+    info!("  GET  /attestation         - TDX DCAP quote (for oracle registration)");
     info!("  POST /session             - Create session (assetId required)");
     info!("  GET  /notarize?sessionId= - WebSocket MPC-TLS + settlement");
     info!("  GET  /proxy?token=        - WebSocket-to-TCP proxy");
@@ -193,6 +208,7 @@ async fn main() -> eyre::Result<()> {
             .expect("tls.private_key_path is required when tls.enabled = true");
 
         let rustls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+        info!("TLS enabled: cert={}, key={}", cert_path, key_path);
         axum_server::bind_rustls(addr, rustls_config)
             .serve(app.into_make_service())
             .await?;
@@ -216,11 +232,14 @@ async fn health_handler() -> impl IntoResponse {
 /// GET /info — server version and oracle address.
 async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let git_hash = std::env::var("GIT_HASH").unwrap_or_else(|_| "dev".to_string());
+    let backend = attestation::detect_tdx_backend();
 
     Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION"),
         git_hash,
         oracle_address: format!("{}", state.oracle_signer.address()),
+        tdx_enabled: attestation::is_tdx_available(),
+        tdx_backend: format!("{:?}", backend),
     })
 }
 
