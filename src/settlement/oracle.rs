@@ -109,19 +109,34 @@ fn decide_trade_offer(
         });
     }
 
-    // Validate partner - the partner in the API response should be either buyer or seller
-    let capturer_steam_id = extract_steam_id_from_cookie(sent_bytes)
-        .map_err(SettlementError::ParseFailed)?;
-
-    let capturer_is_seller = capturer_steam_id == escrow.seller_steam_id;
-    let capturer_is_buyer = capturer_steam_id == escrow.buyer_steam_id;
-
-    if !capturer_is_seller && !capturer_is_buyer {
-        return Err(SettlementError::PartnerMismatch {
-            expected: escrow.seller_steam_id,
-            got: capturer_steam_id,
-        });
-    }
+    // Determine capturer identity:
+    // 1. Try steamLoginSecure cookie (SteamCommunity / legacy path)
+    // 2. Fall back to inferring from accountid_other + escrow (API access_token path)
+    let (capturer_is_seller, _capturer_is_buyer) =
+        if let Ok(capturer_steam_id) = extract_steam_id_from_cookie(sent_bytes) {
+            let is_seller = capturer_steam_id == escrow.seller_steam_id;
+            let is_buyer = capturer_steam_id == escrow.buyer_steam_id;
+            if !is_seller && !is_buyer {
+                return Err(SettlementError::PartnerMismatch {
+                    expected: escrow.seller_steam_id,
+                    got: capturer_steam_id,
+                });
+            }
+            (is_seller, is_buyer)
+        } else {
+            // No cookie — infer capturer from accountid_other (the counterparty)
+            // If partner == buyer, capturer must be seller, and vice versa
+            if data.partner_steam_id == escrow.buyer_steam_id {
+                (true, false) // capturer = seller
+            } else if data.partner_steam_id == escrow.seller_steam_id {
+                (false, true) // capturer = buyer
+            } else {
+                return Err(SettlementError::PartnerMismatch {
+                    expected: escrow.buyer_steam_id,
+                    got: data.partner_steam_id,
+                });
+            }
+        };
 
     // Validate partner steam ID (accountid_other should be the counterparty)
     let expected_partner = if capturer_is_seller {
@@ -359,6 +374,51 @@ mod tests {
 
         let result = decide(STEAM_API_HOST, &sent, &recv, &escrow);
         assert!(matches!(result, Err(SettlementError::TradeOfferIdMismatch { .. })));
+    }
+
+    /// Helper: API access token request (no steamLoginSecure cookie)
+    fn make_trade_offer_request_api_token() -> Vec<u8> {
+        b"GET /IEconService/GetTradeOffer/v1/?format=json&get_descriptions=false&tradeofferid=8653813160&access_token=SECRET HTTP/1.1\r\n\
+          Host: api.steampowered.com\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n".to_vec()
+    }
+
+    #[test]
+    fn test_decide_trade_offer_api_token_release() {
+        let escrow = test_escrow();
+        // No cookie — capturer inferred from accountid_other
+        // accountid_other=444017009 → partner=76561198404282737 (buyer) → capturer=seller
+        let sent = make_trade_offer_request_api_token();
+        let json = r#"{"response":{"offer":{"tradeofferid":"8653813160","trade_offer_state":3,"accountid_other":444017009,"items_to_receive":[{"appid":730,"assetid":"40964044588"}]}}}"#;
+        let recv = make_http_response(json);
+
+        let result = decide(STEAM_API_HOST, &sent, &recv, &escrow).unwrap();
+        assert_eq!(result.decision, Decision::Release);
+        assert_eq!(result.refund_reason, RefundReason::None);
+    }
+
+    #[test]
+    fn test_decide_trade_offer_api_token_expired() {
+        let escrow = test_escrow();
+        let sent = make_trade_offer_request_api_token();
+        // accountid_other=444017009 → partner=buyer → capturer=seller, is_our_offer=true → seller created → BuyerExpired
+        let json = r#"{"response":{"offer":{"tradeofferid":"8653813160","trade_offer_state":5,"accountid_other":444017009,"is_our_offer":true,"items_to_receive":[{"appid":730,"assetid":"40964044588"}]}}}"#;
+        let recv = make_http_response(json);
+
+        let result = decide(STEAM_API_HOST, &sent, &recv, &escrow).unwrap();
+        assert_eq!(result.decision, Decision::Refund);
+        assert_eq!(result.refund_reason, RefundReason::BuyerExpired);
+    }
+
+    #[test]
+    fn test_decide_trade_offer_api_token_unknown_partner() {
+        let escrow = test_escrow();
+        let sent = make_trade_offer_request_api_token();
+        // accountid_other=999 → partner=76561198404265727 — neither buyer nor seller
+        let json = r#"{"response":{"offer":{"tradeofferid":"8653813160","trade_offer_state":3,"accountid_other":999,"items_to_receive":[{"appid":730,"assetid":"40964044588"}]}}}"#;
+        let recv = make_http_response(json);
+
+        let result = decide(STEAM_API_HOST, &sent, &recv, &escrow);
+        assert!(matches!(result, Err(SettlementError::PartnerMismatch { .. })));
     }
 
     #[test]

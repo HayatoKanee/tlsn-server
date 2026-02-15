@@ -2,7 +2,7 @@
 name = "tlsn-server"
 version = "0.1.0"
 edition = "2024"
-description = "TLSNotary Notary Server for alpha 14"
+description = "TLSNotary Verifier + Oracle Server for alpha 14"
 license = "MIT OR Apache-2.0"
 
 [lib]
@@ -35,8 +35,6 @@ futures-util = "0.3"
 async-trait = "0.1"
 
 # Cryptography
-k256 = { version = "0.13", features = ["pkcs8"] }
-rand = "0.8"
 sha1 = "0.10"
 sha3 = "0.10"
 base64 = "0.22"
@@ -45,8 +43,11 @@ hex = "0.4"
 # Compression
 miniz_oxide = "0.8"
 
-# Ethereum (oracle settlement)
-alloy = { version = "0.15", features = ["full"] }
+# Ethereum (oracle EIP-712 signing + on-chain reads)
+alloy = { version = "0.15", features = ["signers", "signer-local", "sol-types"] }
+
+# HTTP client (on-chain eth_call for escrow reads)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Serialization
 bincode = "1.3"

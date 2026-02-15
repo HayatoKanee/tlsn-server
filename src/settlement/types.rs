@@ -9,56 +9,31 @@ use serde::{Deserialize, Serialize};
 pub const STEAM64_OFFSET: u64 = 76561197960265728;
 
 // ============================================================================
-// EscrowSnapshot (from session POST body)
+// EscrowSnapshot (read from on-chain by ChainReader)
 // ============================================================================
 
-/// On-chain escrow data snapshot provided by the extension in POST /session.
+/// On-chain escrow data read from JJSKIN contract + SteamAccountFactory.
 ///
-/// ## Security: batch_hash protects against tampering
-/// The oracle computes commitment = keccak256(snapshot fields).
-/// For single settlement: batch_hash = commitment.
-/// Contract compares batch_hash with stored escrowCommitment[assetId].
-/// If extension sends wrong escrow data → wrong commitment → wrong batch_hash → contract reverts.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// Constructed by `ChainReader::read_escrow()` from trustless on-chain state.
+/// Extension only provides `assetId` as a lookup hint.
+#[derive(Serialize, Debug, Clone)]
 pub struct EscrowSnapshot {
     /// Steam asset ID being traded
     pub asset_id: u64,
-    /// Trade offer ID committed by seller
+    /// Trade offer ID committed by seller (from Purchase.tradeOfferId)
     pub trade_offer_id: u64,
-    /// Seller's Steam64 ID
+    /// Seller's Steam64 ID (from SteamAccountFactory)
     pub seller_steam_id: u64,
-    /// Buyer's Steam64 ID
+    /// Buyer's Steam64 ID (from SteamAccountFactory)
     pub buyer_steam_id: u64,
-    /// Seller's wallet address (20 bytes)
+    /// Seller's wallet address (from Listing.seller)
     pub seller: [u8; 20],
-    /// Buyer's wallet address (20 bytes)
+    /// Buyer's wallet address (from Purchase.buyer)
     pub buyer: [u8; 20],
-    /// USDC amount (6 decimals)
+    /// USDC amount (from Listing.price, 6 decimals)
     pub amount: u64,
-    /// Purchase timestamp (Unix seconds)
+    /// Purchase timestamp (from Purchase.purchaseTime, Unix seconds)
     pub purchase_time: u64,
-}
-
-impl EscrowSnapshot {
-    /// Compute commitment hash for batch_hash calculation.
-    ///
-    /// MUST match contract's keccak256(abi.encodePacked(
-    ///     uint64(assetId), tradeOfferId, sellerSteamId, buyerSteamId, uint64(amount), uint40(purchaseTime)
-    /// ))
-    pub fn commitment(&self) -> [u8; 32] {
-        use sha3::{Digest, Keccak256};
-
-        let mut hasher = Keccak256::new();
-        hasher.update(self.asset_id.to_be_bytes());
-        hasher.update(self.trade_offer_id.to_be_bytes());
-        hasher.update(self.seller_steam_id.to_be_bytes());
-        hasher.update(self.buyer_steam_id.to_be_bytes());
-        hasher.update(self.amount.to_be_bytes());
-        // purchaseTime as uint40 (5 bytes) to match Solidity's uint40
-        hasher.update(&self.purchase_time.to_be_bytes()[3..8]);
-
-        hasher.finalize().into()
-    }
 }
 
 // ============================================================================
@@ -153,7 +128,7 @@ pub struct CommunityProofData {
 /// Both verifier and WASM prover define this independently (no shared dep).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SettlementResult {
-    pub tx_hash: [u8; 32],
+    pub signature: Vec<u8>,  // 65 bytes: r || s || v (EIP-712)
     pub asset_id: u64,
     pub decision: u8,       // 0=Release, 1=Refund
     pub refund_reason: u8,  // RefundReason enum value

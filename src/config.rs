@@ -26,12 +26,9 @@ pub struct NotarizationConfig {
     /// Maximum bytes the prover can receive through TLS.
     #[serde(default = "default_max_recv_data")]
     pub max_recv_data: usize,
-    /// Timeout for the notarization session in seconds.
+    /// Timeout for the MPC-TLS session in seconds.
     #[serde(default = "default_timeout")]
     pub timeout: u64,
-    /// Path to secp256k1 private key in PEM (PKCS8) format.
-    /// If null/missing, an ephemeral key is generated on startup.
-    pub private_key_pem_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,21 +39,24 @@ pub struct TlsConfig {
     pub certificate_path: Option<String>,
 }
 
-/// Oracle settlement configuration.
+/// Oracle settlement configuration (always enabled — single verifier path).
 #[derive(Debug, Clone, Deserialize)]
 pub struct OracleConfig {
-    /// Enable oracle settlement mode.
-    #[serde(default)]
-    pub enabled: bool,
     /// Path to oracle Ethereum private key (hex format).
+    /// Can also be set via ORACLE_SIGNING_KEY env var.
     pub signing_key_path: Option<String>,
-    /// Ethereum RPC URL (e.g. Arbitrum).
-    pub rpc_url: Option<String>,
-    /// JJSKIN contract address.
-    pub contract_address: Option<String>,
+    /// JJSKIN contract address (required for EIP-712 domain separator + escrow reads).
+    #[serde(default = "default_contract_address")]
+    pub contract_address: String,
     /// Chain ID (default: 42161 for Arbitrum One).
     #[serde(default = "default_chain_id")]
     pub chain_id: u64,
+    /// Arbitrum RPC URL for on-chain escrow reads.
+    #[serde(default = "default_rpc_url")]
+    pub rpc_url: String,
+    /// SteamAccountFactory contract address (for Steam ID ↔ wallet mapping).
+    #[serde(default = "default_contract_address")]
+    pub steam_factory_address: String,
 }
 
 impl Default for Config {
@@ -77,7 +77,6 @@ impl Default for NotarizationConfig {
             max_sent_data: default_max_sent_data(),
             max_recv_data: default_max_recv_data(),
             timeout: default_timeout(),
-            private_key_pem_path: None,
         }
     }
 }
@@ -95,11 +94,11 @@ impl Default for TlsConfig {
 impl Default for OracleConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             signing_key_path: None,
-            rpc_url: None,
-            contract_address: None,
+            contract_address: default_contract_address(),
             chain_id: default_chain_id(),
+            rpc_url: default_rpc_url(),
+            steam_factory_address: default_contract_address(),
         }
     }
 }
@@ -149,4 +148,12 @@ fn default_timeout() -> u64 {
 
 fn default_chain_id() -> u64 {
     42161 // Arbitrum One
+}
+
+fn default_rpc_url() -> String {
+    "https://arb1.arbitrum.io/rpc".to_string()
+}
+
+fn default_contract_address() -> String {
+    "0x0000000000000000000000000000000000000000".to_string()
 }

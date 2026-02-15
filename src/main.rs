@@ -1,9 +1,8 @@
 mod axum_websocket;
 mod config;
-mod notary;
 mod proxy;
 mod settlement;
-mod signing;
+mod verifier;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -25,16 +24,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 use ws_stream_tungstenite::WsStream;
 
 use tlsn::{config::verifier::VerifierConfig, webpki::RootCertStore};
 
 use config::Config;
-use settlement::wallet::OracleWallet;
-use settlement::EscrowSnapshot;
-use signing::NotaryKey;
+use settlement::{ChainReader, OracleSigner};
 
 // ============================================================================
 // Application State
@@ -44,15 +41,15 @@ use signing::NotaryKey;
 struct SessionData {
     max_sent_data: usize,
     max_recv_data: usize,
-    escrow: Option<EscrowSnapshot>,
+    asset_id: u64,
 }
 
 /// Shared application state.
 struct AppState {
     sessions: Mutex<HashMap<String, SessionData>>,
     config: Config,
-    notary_key: NotaryKey,
-    oracle_wallet: Option<OracleWallet>,
+    oracle_signer: OracleSigner,
+    chain_reader: ChainReader,
 }
 
 // ============================================================================
@@ -60,7 +57,7 @@ struct AppState {
 // ============================================================================
 
 #[derive(Parser, Debug)]
-#[command(name = "tlsn-server", version, about = "TLSNotary Notary Server")]
+#[command(name = "tlsn-server", version, about = "TLSNotary Verifier + Oracle Server")]
 struct Args {
     /// Path to the configuration YAML file.
     #[arg(short, long, default_value = "config.yaml")]
@@ -77,8 +74,9 @@ struct SessionRequest {
     max_sent_data: Option<usize>,
     #[serde(rename = "maxRecvData")]
     max_recv_data: Option<usize>,
-    /// Optional escrow snapshot for oracle settlement.
-    escrow: Option<EscrowSnapshot>,
+    /// Asset ID for on-chain escrow lookup (required).
+    #[serde(rename = "assetId")]
+    asset_id: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,14 +88,10 @@ struct SessionResponse {
 #[derive(Debug, Serialize)]
 struct InfoResponse {
     version: &'static str,
-    #[serde(rename = "publicKey")]
-    public_key: String,
     #[serde(rename = "gitHash")]
     git_hash: String,
-    #[serde(rename = "oracleEnabled")]
-    oracle_enabled: bool,
-    #[serde(rename = "oracleAddress", skip_serializing_if = "Option::is_none")]
-    oracle_address: Option<String>,
+    #[serde(rename = "oracleAddress")]
+    oracle_address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,28 +122,31 @@ async fn main() -> eyre::Result<()> {
     info!("  max_sent_data: {}", config.notarization.max_sent_data);
     info!("  max_recv_data: {}", config.notarization.max_recv_data);
     info!("  timeout: {}s", config.notarization.timeout);
-    info!("  oracle.enabled: {}", config.oracle.enabled);
 
-    // Initialize signing key.
-    let notary_key =
-        signing::create_notary_key(config.notarization.private_key_pem_path.as_deref())?;
+    // Initialize oracle signer (required — single verifier path).
+    let oracle_signer = OracleSigner::from_config(&config.oracle)?;
+    info!("Oracle signer: address={}", oracle_signer.address());
 
-    // Initialize oracle wallet if enabled.
-    let oracle_wallet = if config.oracle.enabled {
-        match OracleWallet::from_config(&config.oracle) {
-            Ok(wallet) => {
-                info!("Oracle settlement enabled: address={}", wallet.address());
-                Some(wallet)
-            }
-            Err(e) => {
-                error!("Failed to initialize oracle wallet: {e}");
-                return Err(e);
-            }
-        }
-    } else {
-        info!("Oracle settlement disabled");
-        None
-    };
+    // Initialize chain reader for on-chain escrow reads.
+    let jjskin_address = config
+        .oracle
+        .contract_address
+        .parse()
+        .map_err(|e| eyre::eyre!("Invalid contract_address: {e}"))?;
+    let factory_address = config
+        .oracle
+        .steam_factory_address
+        .parse()
+        .map_err(|e| eyre::eyre!("Invalid steam_factory_address: {e}"))?;
+    let chain_reader = ChainReader::new(
+        config.oracle.rpc_url.clone(),
+        jjskin_address,
+        factory_address,
+    );
+    info!(
+        "Chain reader: rpc={}, contract={}, factory={}",
+        config.oracle.rpc_url, config.oracle.contract_address, config.oracle.steam_factory_address
+    );
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
@@ -158,8 +155,8 @@ async fn main() -> eyre::Result<()> {
     let app_state = Arc::new(AppState {
         sessions: Mutex::new(HashMap::new()),
         config,
-        notary_key,
-        oracle_wallet,
+        oracle_signer,
+        chain_reader,
     });
 
     let tls_config = app_state.config.tls.clone();
@@ -175,14 +172,14 @@ async fn main() -> eyre::Result<()> {
 
     let tls_enabled = tls_config.enabled;
     info!(
-        "TLSNotary Notary Server starting on {} (TLS: {})",
+        "TLSNotary Verifier Server starting on {} (TLS: {})",
         addr,
         if tls_enabled { "enabled" } else { "disabled" }
     );
     info!("  GET  /health              - Health check");
-    info!("  GET  /info                - Server info + public key");
-    info!("  POST /session             - Create notarization session");
-    info!("  GET  /notarize?sessionId= - WebSocket notarization");
+    info!("  GET  /info                - Server info + oracle address");
+    info!("  POST /session             - Create session (assetId required)");
+    info!("  GET  /notarize?sessionId= - WebSocket MPC-TLS + settlement");
     info!("  GET  /proxy?token=        - WebSocket-to-TCP proxy");
 
     if tls_enabled {
@@ -216,25 +213,21 @@ async fn health_handler() -> impl IntoResponse {
     "ok"
 }
 
-/// GET /info — server version, notary public key, and oracle status.
+/// GET /info — server version and oracle address.
 async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let git_hash = std::env::var("GIT_HASH").unwrap_or_else(|_| "dev".to_string());
 
-    let oracle_address = state
-        .oracle_wallet
-        .as_ref()
-        .map(|w| format!("{}", w.address()));
-
     Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION"),
-        public_key: hex::encode(&state.notary_key.public_key),
         git_hash,
-        oracle_enabled: state.oracle_wallet.is_some(),
-        oracle_address,
+        oracle_address: format!("{}", state.oracle_signer.address()),
     })
 }
 
-/// POST /session — create a new notarization session.
+/// POST /session — create a new MPC-TLS session.
+///
+/// Extension provides `assetId` as a lookup hint. Escrow data is read
+/// from on-chain by ChainReader during settlement (not from extension).
 async fn session_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SessionRequest>,
@@ -267,16 +260,6 @@ async fn session_handler(
         ));
     }
 
-    // Validate escrow if oracle is not enabled but escrow is provided
-    if body.escrow.is_some() && state.oracle_wallet.is_none() {
-        warn!(
-            "[{}] Escrow provided but oracle settlement is disabled — ignoring",
-            session_id
-        );
-    }
-
-    let has_escrow = body.escrow.is_some() && state.oracle_wallet.is_some();
-
     {
         let mut sessions = state.sessions.lock().await;
         sessions.insert(
@@ -284,14 +267,13 @@ async fn session_handler(
             SessionData {
                 max_sent_data,
                 max_recv_data,
-                escrow: if has_escrow { body.escrow } else { None },
+                asset_id: body.asset_id,
             },
         );
     }
-
     info!(
-        "[{}] Session created: maxSentData={}, maxRecvData={}, settlement={}",
-        session_id, max_sent_data, max_recv_data, has_escrow
+        "[{}] Session created: assetId={}, maxSentData={}, maxRecvData={}",
+        session_id, body.asset_id, max_sent_data, max_recv_data
     );
 
     // Spawn a timeout task to clean up stale sessions.
@@ -311,7 +293,7 @@ async fn session_handler(
     Ok(Json(SessionResponse { session_id }))
 }
 
-/// GET /notarize?sessionId=xxx — WebSocket upgrade for notarization.
+/// GET /notarize?sessionId=xxx — WebSocket upgrade for MPC-TLS + settlement.
 async fn notarize_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -327,7 +309,7 @@ async fn notarize_ws_handler(
 
     match session_data {
         Some(session_data) => {
-            info!("[{}] WebSocket upgrade for notarization", session_id);
+            info!("[{}] WebSocket upgrade for MPC-TLS + settlement", session_id);
             Ok(ws.on_upgrade(move |socket| {
                 handle_notarize_websocket(socket, session_id, session_data, state)
             }))
@@ -342,14 +324,14 @@ async fn notarize_ws_handler(
     }
 }
 
-/// Handle the WebSocket notarization connection.
+/// Handle the WebSocket MPC-TLS + settlement connection.
 async fn handle_notarize_websocket(
     socket: WebSocket,
     session_id: String,
     session_data: SessionData,
     state: Arc<AppState>,
 ) {
-    info!("[{}] WebSocket connected, starting notarization", session_id);
+    info!("[{}] WebSocket connected, starting MPC-TLS", session_id);
 
     let ws_stream = WsStream::new(socket.into_inner());
 
@@ -362,44 +344,40 @@ async fn handle_notarize_websocket(
 
     match timeout(timeout_duration, async {
         // Step 1: Run MPC-TLS
-        let (mpc, mut socket) = notary::run_mpc_tls(ws_stream, verifier_config).await?;
+        let (mpc, mut socket) = verifier::run_mpc_tls(ws_stream, verifier_config).await?;
 
-        // Step 2: Attestation exchange (always)
-        notary::handle_attestation(&mpc, &mut socket, &state.notary_key.provider).await?;
-
-        // Step 3: Settlement (only if escrow was provided AND oracle is enabled)
-        if let (Some(escrow), Some(wallet)) = (&session_data.escrow, &state.oracle_wallet) {
-            info!("[{}] Running oracle settlement for asset_id={}", session_id, escrow.asset_id);
-            match notary::handle_settlement(&mpc, &mut socket, escrow, wallet).await {
-                Ok(()) => {
-                    info!("[{}] Oracle settlement completed", session_id);
-                }
-                Err(e) => {
-                    error!("[{}] Oracle settlement failed: {}", session_id, e);
-                    // Settlement failure doesn't fail the attestation —
-                    // the prover already has the attestation.
-                }
-            }
-        }
-
-        // Close socket
-        futures_util::io::AsyncWriteExt::close(&mut socket)
+        // Step 2: Read escrow from on-chain (trustless source)
+        info!("[{}] Reading escrow from chain for asset_id={}", session_id, session_data.asset_id);
+        let escrow = state
+            .chain_reader
+            .read_escrow(session_data.asset_id)
             .await
-            .map_err(|e| eyre::eyre!("Failed to close socket: {}", e))?;
+            .map_err(|e| eyre::eyre!("Chain read failed: {e}"))?;
+
+        // Step 3: Settlement — use MPC-verified plaintext + on-chain escrow, sign EIP-712
+        info!("[{}] Running oracle settlement", session_id);
+
+        verifier::handle_post_protocol(
+            &mpc,
+            &mut socket,
+            &escrow,
+            &state.oracle_signer,
+        )
+        .await?;
 
         Ok::<(), eyre::Report>(())
     })
     .await
     {
         Ok(Ok(())) => {
-            info!("[{}] Notarization completed successfully", session_id);
+            info!("[{}] MPC-TLS + settlement completed successfully", session_id);
         }
         Ok(Err(e)) => {
-            error!("[{}] Notarization failed: {}", session_id, e);
+            error!("[{}] MPC-TLS + settlement failed: {}", session_id, e);
         }
         Err(_) => {
             error!(
-                "[{}] Notarization timed out after {:?}",
+                "[{}] MPC-TLS + settlement timed out after {:?}",
                 session_id, timeout_duration
             );
         }
