@@ -1,37 +1,43 @@
-loader.entrypoint = "file:{{ gramine.libos }}"
-libos.entrypoint = "/gramine-ratls"
+# TLSNotary Server — Gramine 1.9 SGX manifest for RA-TLS
+#
+# gramine-ratls generates DCAP RA-TLS certificates, then execvp's the
+# child binary (tlsn-server) in the same enclave.
 
 loader.argv = [
   "gramine-ratls",
   "/tmp/crt.pem",
   "/tmp/key.pem",
   "--",
-  "tlsn-server",
+  "/app/tlsn-server",
   "--config", "/app/config-sgx.yaml",
 ]
-
+loader.log_level = "{{ log_level }}"
 loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}"
 loader.env.RUST_BACKTRACE = "full"
 loader.env.RUST_LOG = "info"
-loader.log_level = "{{ log_level }}"
+
+# VFS path where gramine-ratls is mounted (Gramine 1.9 auto-detects loader.entrypoint)
+libos.entrypoint = "/gramine-ratls"
 
 fs.mounts = [
   { path = "/gramine-ratls", uri = "file:{{ entrypoint }}" },
+  { path = "/app", uri = "file:/app" },
   { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
   { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}" },
   { path = "/tmp", type = "tmpfs" },
 ]
 
-sgx.debug = false
-sgx.edmm_enable = true
-sgx.remote_attestation = "dcap"
-sgx.max_threads = 32
-sgx.enclave_size = "512M"
+[sgx]
+debug = false
+edmm_enable = true
+remote_attestation = "dcap"
+max_threads = 32
+# enclave_size omitted — rely on EDMM for dynamic page allocation
 
-sgx.trusted_files = [
+trusted_files = [
   "file:{{ gramine.libos }}",
   "file:{{ entrypoint }}",
-  "file:tlsn-server",
+  "file:/app/tlsn-server",
   "file:{{ gramine.runtimedir() }}/",
   "file:{{ arch_libdir }}/",
   "file:/app/config-sgx.yaml",
@@ -39,11 +45,12 @@ sgx.trusted_files = [
   "file:/etc/ssl/certs/ca-certificates.crt",
 ]
 
-sgx.allowed_files = [
+# /dev/attestation/* is handled internally by Gramine SGX subsystem
+allowed_files = [
   "file:/etc/nsswitch.conf",
   "file:/etc/hosts",
   "file:/etc/resolv.conf",
 ]
 
-sys.enable_sigterm_injection = true
-sys.insecure__allow_eventfd = true
+[sys]
+enable_sigterm_injection = true
