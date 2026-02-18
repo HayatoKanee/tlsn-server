@@ -119,7 +119,10 @@ async fn main() -> eyre::Result<()> {
 
     tracing_subscriber::fmt()
         .with_target(true)
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .with_thread_ids(true)
         .with_line_number(true)
         .init();
