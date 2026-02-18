@@ -16,6 +16,8 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub oracle: OracleConfig,
+    #[serde(default)]
+    pub inspect: InspectConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +61,38 @@ pub struct OracleConfig {
     pub steam_factory_address: String,
 }
 
+/// CS2 item inspection configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InspectConfig {
+    /// Enable the /inspect endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum delay between requests per bot (ms). Steam enforces ~1100ms.
+    #[serde(default = "default_request_delay_ms")]
+    pub request_delay_ms: u64,
+    /// Timeout waiting for GC response (seconds).
+    #[serde(default = "default_request_timeout_s")]
+    pub request_timeout_s: u64,
+    /// Max retries per inspect request (tries different bots on failure).
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Path to bots.json file with Steam bot credentials.
+    #[serde(default = "default_bots_config_path")]
+    pub bots_config_path: String,
+}
+
+impl Default for InspectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            request_delay_ms: default_request_delay_ms(),
+            request_timeout_s: default_request_timeout_s(),
+            max_retries: default_max_retries(),
+            bots_config_path: default_bots_config_path(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -67,6 +101,7 @@ impl Default for Config {
             notarization: NotarizationConfig::default(),
             tls: TlsConfig::default(),
             oracle: OracleConfig::default(),
+            inspect: InspectConfig::default(),
         }
     }
 }
@@ -156,4 +191,20 @@ fn default_rpc_url() -> String {
 
 fn default_contract_address() -> String {
     "0x0000000000000000000000000000000000000000".to_string()
+}
+
+fn default_request_delay_ms() -> u64 {
+    1100
+}
+
+fn default_request_timeout_s() -> u64 {
+    15
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+fn default_bots_config_path() -> String {
+    "bots.json".to_string()
 }

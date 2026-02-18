@@ -1,6 +1,7 @@
 mod attestation;
 mod axum_websocket;
 mod config;
+mod inspect;
 mod proxy;
 mod settlement;
 mod verifier;
@@ -49,7 +50,7 @@ struct SessionData {
 struct AppState {
     sessions: Mutex<HashMap<String, SessionData>>,
     config: Config,
-    oracle_signer: OracleSigner,
+    oracle_signer: Arc<OracleSigner>,
     chain_reader: ChainReader,
 }
 
@@ -161,9 +162,36 @@ async fn main() -> eyre::Result<()> {
     // Bind oracle address for TDX attestation (no-op outside TDX).
     attestation::bind_oracle_address(oracle_signer.address());
 
+    // Wrap oracle signer in Arc for sharing between AppState and InspectState.
+    let oracle_signer = Arc::new(oracle_signer);
+
+    // Initialize CS2 inspect bot pool (if enabled).
+    let inspect_enabled = config.inspect.enabled;
+    let inspect_state: Option<Arc<inspect::InspectState>> = if inspect_enabled {
+        info!("Inspect module enabled, initializing bot pool...");
+        match inspect::bot_pool::BotPool::new(&config.inspect).await {
+            Ok(pool) => {
+                info!("Bot pool ready: {} bots", pool.bot_count());
+                Some(Arc::new(inspect::InspectState {
+                    pool,
+                    signer: oracle_signer.clone(),
+                }))
+            }
+            Err(e) => {
+                error!("Failed to initialize bot pool: {} — inspect disabled", e);
+                None
+            }
+        }
+    } else {
+        info!("Inspect module disabled");
+        None
+    };
+
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .expect("Invalid host:port");
+
+    let tls_config = config.tls.clone();
 
     let app_state = Arc::new(AppState {
         sessions: Mutex::new(HashMap::new()),
@@ -172,17 +200,28 @@ async fn main() -> eyre::Result<()> {
         chain_reader,
     });
 
-    let tls_config = app_state.config.tls.clone();
-
-    let app = Router::new()
+    // Build main routes (oracle / MPC-TLS).
+    let main_routes = Router::new()
         .route("/health", get(health_handler))
         .route("/info", get(info_handler))
         .route("/attestation", get(attestation::attestation_handler))
         .route("/session", post(session_handler))
         .route("/notarize", get(notarize_ws_handler))
         .route("/proxy", get(proxy::proxy_ws_handler))
-        .layer(CorsLayer::permissive())
         .with_state(app_state);
+
+    // Conditionally add inspect routes (separate state: Arc<InspectState>).
+    let app = if let Some(inspect_state) = inspect_state {
+        let inspect_routes = Router::new()
+            .route("/", get(inspect::inspect_handler))
+            .route("/bulk", post(inspect::bulk_handler))
+            .with_state(inspect_state);
+        main_routes.nest("/inspect", inspect_routes)
+    } else {
+        main_routes
+    };
+
+    let app = app.layer(CorsLayer::permissive());
 
     let tls_enabled = tls_config.enabled;
     info!(
@@ -196,6 +235,10 @@ async fn main() -> eyre::Result<()> {
     info!("  POST /session             - Create session (assetId required)");
     info!("  GET  /notarize?sessionId= - WebSocket MPC-TLS + settlement");
     info!("  GET  /proxy?token=        - WebSocket-to-TCP proxy");
+    if inspect_enabled {
+        info!("  GET  /inspect?url=        - CS2 item inspection (single)");
+        info!("  POST /inspect/bulk        - CS2 item inspection (batch)");
+    }
 
     if tls_enabled {
         let cert_path = tls_config

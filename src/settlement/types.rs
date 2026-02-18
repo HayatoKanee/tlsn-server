@@ -75,6 +75,8 @@ pub enum RefundReason {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Settlement {
     pub asset_id: u64,
+    /// Trade offer ID from on-chain escrow (included in EIP-712 signature as uint48)
+    pub trade_offer_id: u64,
     pub decision: Decision,
     pub refund_reason: RefundReason,
 }

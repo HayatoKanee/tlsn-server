@@ -8,9 +8,15 @@ use tracing::info;
 use super::types::Settlement;
 use crate::config::OracleConfig;
 
-/// EIP-712 type hash: keccak256("Settlement(uint64 assetId,uint8 decision,uint8 refundReason)")
-static SETTLEMENT_TYPEHASH: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"Settlement(uint64 assetId,uint8 decision,uint8 refundReason)"));
+/// EIP-712 type hash: must match JJSKIN.sol SETTLEMENT_TYPEHASH
+static SETTLEMENT_TYPEHASH: LazyLock<B256> = LazyLock::new(|| {
+    keccak256(b"Settlement(uint64 assetId,uint48 tradeOfferId,uint8 decision,uint8 refundReason)")
+});
+
+/// EIP-712 type hash: must match JJSKIN.sol ITEM_ATTESTATION_TYPEHASH
+static ITEM_ATTESTATION_TYPEHASH: LazyLock<B256> = LazyLock::new(|| {
+    keccak256(b"ItemAttestation(uint64 assetId,uint64 itemDetail)")
+});
 
 /// EIP-712 domain separator type hash
 static EIP712_DOMAIN_TYPEHASH: LazyLock<B256> = LazyLock::new(|| {
@@ -111,6 +117,23 @@ impl OracleSigner {
         // as_bytes() returns [u8; 65]: r (32) || s (32) || v (1, 27 or 28)
         Ok(signature.as_bytes().to_vec())
     }
+
+    /// Sign an item attestation using EIP-712.
+    ///
+    /// Attests that `assetId` has the given `itemDetail` (packed uint64).
+    /// Returns 65 bytes: r (32) || s (32) || v (1).
+    pub async fn sign_item_attestation(&self, asset_id: u64, item_detail: u64) -> Result<Vec<u8>> {
+        let struct_hash = compute_item_attestation_struct_hash(asset_id, item_detail);
+        let digest = compute_eip712_digest(self.domain_separator, struct_hash);
+
+        let signature = self
+            .signer
+            .sign_hash(&digest)
+            .await
+            .map_err(|e| eyre!("Failed to sign item attestation: {e}"))?;
+
+        Ok(signature.as_bytes().to_vec())
+    }
 }
 
 /// Compute EIP-712 domain separator.
@@ -143,18 +166,23 @@ fn compute_domain_separator(chain_id: u64, contract_address: Address) -> B256 {
 
 /// Compute struct hash for Settlement.
 ///
-/// Matches Solidity:
+/// Matches Solidity (JJSKIN.sol):
 /// ```text
-/// keccak256(abi.encode(SETTLEMENT_TYPEHASH, assetId, decision, refundReason))
+/// keccak256(abi.encode(SETTLEMENT_TYPEHASH, assetId, uint48(tradeOfferId), decision, refundReason))
 /// ```
 ///
 /// abi.encode pads each value to 32 bytes.
 fn compute_struct_hash(settlement: &Settlement) -> B256 {
-    let mut encoded = Vec::with_capacity(4 * 32);
+    let mut encoded = Vec::with_capacity(5 * 32);
     encoded.extend_from_slice((*SETTLEMENT_TYPEHASH).as_ref());
     // uint64 assetId → uint256 (left-padded to 32 bytes)
     encoded
         .extend_from_slice(&FixedBytes::<32>::left_padding_from(&settlement.asset_id.to_be_bytes()).0);
+    // uint48 tradeOfferId → uint256 (left-padded to 32 bytes)
+    // Stored as u64 in Rust but ABI-encoded as uint48 (Solidity casts to uint48)
+    encoded.extend_from_slice(
+        &FixedBytes::<32>::left_padding_from(&settlement.trade_offer_id.to_be_bytes()).0,
+    );
     // uint8 decision → uint256 (left-padded to 32 bytes)
     encoded
         .extend_from_slice(&FixedBytes::<32>::left_padding_from(&[settlement.decision as u8]).0);
@@ -162,6 +190,23 @@ fn compute_struct_hash(settlement: &Settlement) -> B256 {
     encoded.extend_from_slice(
         &FixedBytes::<32>::left_padding_from(&[settlement.refund_reason as u8]).0,
     );
+
+    keccak256(&encoded)
+}
+
+/// Compute struct hash for ItemAttestation.
+///
+/// Matches Solidity (JJSKIN.sol):
+/// ```text
+/// keccak256(abi.encode(ITEM_ATTESTATION_TYPEHASH, assetId, itemDetail))
+/// ```
+fn compute_item_attestation_struct_hash(asset_id: u64, item_detail: u64) -> B256 {
+    let mut encoded = Vec::with_capacity(3 * 32);
+    encoded.extend_from_slice((*ITEM_ATTESTATION_TYPEHASH).as_ref());
+    // uint64 assetId → uint256 (left-padded to 32 bytes)
+    encoded.extend_from_slice(&FixedBytes::<32>::left_padding_from(&asset_id.to_be_bytes()).0);
+    // uint64 itemDetail → uint256 (left-padded to 32 bytes)
+    encoded.extend_from_slice(&FixedBytes::<32>::left_padding_from(&item_detail.to_be_bytes()).0);
 
     keccak256(&encoded)
 }
@@ -204,6 +249,7 @@ mod tests {
 
         let settlement = Settlement {
             asset_id: 12345,
+            trade_offer_id: 67890,
             decision: Decision::Release,
             refund_reason: RefundReason::None,
         };
@@ -243,11 +289,13 @@ mod tests {
     fn test_struct_hash_deterministic() {
         let s1 = Settlement {
             asset_id: 12345,
+            trade_offer_id: 67890,
             decision: Decision::Release,
             refund_reason: RefundReason::None,
         };
         let s2 = Settlement {
             asset_id: 12345,
+            trade_offer_id: 67890,
             decision: Decision::Refund,
             refund_reason: RefundReason::BuyerExpired,
         };
@@ -259,5 +307,55 @@ mod tests {
         // Same input → same hash
         let h3 = compute_struct_hash(&s1);
         assert_eq!(h1, h3);
+    }
+
+    /// Test item attestation sign + ecrecover roundtrip.
+    #[tokio::test]
+    async fn test_sign_item_attestation_and_recover() {
+        let key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let signer: PrivateKeySigner = key_hex.parse().unwrap();
+        let expected_address = signer.address();
+
+        let chain_id = 42161u64;
+        let contract_address: Address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+            .parse()
+            .unwrap();
+
+        let domain_separator = compute_domain_separator(chain_id, contract_address);
+        let oracle_signer = OracleSigner {
+            signer,
+            domain_separator,
+        };
+
+        let asset_id = 39388024803u64;
+        let item_detail = 12345678901234u64;
+
+        let sig_bytes = oracle_signer
+            .sign_item_attestation(asset_id, item_detail)
+            .await
+            .unwrap();
+        assert_eq!(sig_bytes.len(), 65);
+
+        // Verify ecrecover
+        let struct_hash = compute_item_attestation_struct_hash(asset_id, item_detail);
+        let digest = compute_eip712_digest(domain_separator, struct_hash);
+
+        let v = sig_bytes[64];
+        let sig = alloy::primitives::Signature::from_bytes_and_parity(&sig_bytes[..64], v != 27);
+        let recovered = sig.recover_address_from_prehash(&digest).unwrap();
+        assert_eq!(recovered, expected_address);
+    }
+
+    /// Test item attestation struct hash is deterministic and varies with inputs.
+    #[test]
+    fn test_item_attestation_struct_hash() {
+        let h1 = compute_item_attestation_struct_hash(100, 200);
+        let h2 = compute_item_attestation_struct_hash(100, 201);
+        let h3 = compute_item_attestation_struct_hash(101, 200);
+        let h4 = compute_item_attestation_struct_hash(100, 200);
+
+        assert_ne!(h1, h2, "different itemDetail → different hash");
+        assert_ne!(h1, h3, "different assetId → different hash");
+        assert_eq!(h1, h4, "same inputs → same hash");
     }
 }

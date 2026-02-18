@@ -25,5 +25,6 @@ WORKDIR /app
 COPY --from=builder /app/target/release/tlsn-server .
 COPY config-tdx.yaml config.yaml
 COPY notary.key .
+COPY bots.json .
 EXPOSE 7047
 ENTRYPOINT ["./tlsn-server", "--config", "config.yaml"]

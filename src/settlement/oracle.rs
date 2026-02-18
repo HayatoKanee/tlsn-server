@@ -166,6 +166,7 @@ fn decide_trade_offer(
     if data.state == 3 {
         return Ok(Settlement {
             asset_id: escrow.asset_id,
+            trade_offer_id: escrow.trade_offer_id,
             decision: Decision::Release,
             refund_reason: RefundReason::None,
         });
@@ -206,6 +207,7 @@ fn decide_trade_offer(
 
     Ok(Settlement {
         asset_id: escrow.asset_id,
+        trade_offer_id: escrow.trade_offer_id,
         decision: Decision::Refund,
         refund_reason,
     })
@@ -246,6 +248,7 @@ fn decide_trade_status(
     if data.status == 3 {
         return Ok(Settlement {
             asset_id: escrow.asset_id,
+            trade_offer_id: escrow.trade_offer_id,
             decision: Decision::Release,
             refund_reason: RefundReason::None,
         });
@@ -255,6 +258,7 @@ fn decide_trade_status(
     if data.status == 1 {
         return Ok(Settlement {
             asset_id: escrow.asset_id,
+            trade_offer_id: escrow.trade_offer_id,
             decision: Decision::Refund,
             refund_reason: RefundReason::TradeRollback,
         });
@@ -284,6 +288,7 @@ fn decide_community(
     if data.trade_not_found {
         return Ok(Settlement {
             asset_id: escrow.asset_id,
+            trade_offer_id: escrow.trade_offer_id,
             decision: Decision::Refund,
             refund_reason: RefundReason::TradeNotExist,
         });

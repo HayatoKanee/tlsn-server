@@ -2,8 +2,8 @@ host: "0.0.0.0"
 port: 7047
 
 notarization:
-  max_sent_data: 4096
-  max_recv_data: 16384
+  max_sent_data: 2048
+  max_recv_data: 4096
   timeout: 120
   private_key_pem_path: "/app/notary.key"
 
@@ -13,7 +13,14 @@ tls:
 oracle:
   # No signing key configured — key is generated inside the TDX VM at each boot.
   # The private key never leaves TDX encrypted memory.
-  contract_address: "0xbc2881e3f247F38a4B362bAF21829b17ea141Af1"  # JJSKIN on Arbitrum Sepolia
+  contract_address: "0xe2286c2e6D274BeF900281Cd5802482D2360cf78"  # JJSKIN on Arbitrum Sepolia
   chain_id: 421614  # Arbitrum Sepolia
   rpc_url: "https://sepolia-rollup.arbitrum.io/rpc"
   steam_factory_address: "0x627f747eb08442d0A61fC65093f21210142d013f"  # SteamAccountFactory on Arbitrum Sepolia
+
+inspect:
+  enabled: true
+  request_delay_ms: 1100    # Per-bot rate limit (Steam enforced)
+  request_timeout_s: 15     # Timeout for GC response
+  max_retries: 3
+  bots_config_path: "/app/bots.json"
