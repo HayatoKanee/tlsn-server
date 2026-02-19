@@ -174,10 +174,15 @@ async fn main() -> eyre::Result<()> {
         info!("Inspect module enabled, initializing bot pool...");
         match inspect::bot_pool::BotPool::new(&config.inspect).await {
             Ok(pool) => {
-                info!("Bot pool ready: {} bots", pool.bot_count());
+                let cache = inspect::cache::InspectCache::new(
+                    100_000,
+                    Duration::from_secs(3600),
+                );
+                info!("Bot pool ready: {} bots, inspect cache: 100k cap / 1h TTL", pool.bot_count());
                 Some(Arc::new(inspect::InspectState {
                     pool,
                     signer: oracle_signer.clone(),
+                    cache,
                 }))
             }
             Err(e) => {

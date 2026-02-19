@@ -54,9 +54,19 @@ const RELOG_VARIANCE_SECS: u64 = 4 * 60;
 /// Consecutive timeouts before marking a bot as unhealthy.
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
 
-/// Cooldown after a failed on-demand connect attempt (proxied bots only).
-/// Prevents hammering a dead proxy on every inspect request.
-const ON_DEMAND_CONNECT_COOLDOWN: Duration = Duration::from_secs(60);
+/// Timeout for eager warmup connections at startup.
+/// Must be long enough for connect_session_with_retry (handles LoggedInElsewhere):
+/// ~5s connect + 35s retry delay + ~5s reconnect + 30s GC handshake = ~75s, so 90s is safe.
+const WARMUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// TTL for cached ServerList (avoid re-discovering CM servers on every connect).
+const SERVER_LIST_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Batch size for parallel warmup connections.
+const WARMUP_BATCH_SIZE: usize = 20;
+
+/// Delay between inspect retries to avoid instant retry storms.
+const RETRY_DELAY: Duration = Duration::from_millis(200);
 
 // ============================================================================
 // Bot pool — manages authenticated Steam bots for CS2 GC inspect requests.
@@ -66,8 +76,9 @@ pub struct BotPool {
     bots: Vec<Arc<Bot>>,
     next: AtomicUsize,
     config: InspectConfig,
-    /// Stored for relog + on-demand connect: credentials
     bots_config: BotsConfig,
+    /// Cached CM server list to avoid re-discovering on every connect.
+    server_list_cache: Arc<tokio::sync::RwLock<Option<(Arc<ServerList>, Instant)>>>,
 }
 
 struct Bot {
@@ -82,20 +93,18 @@ struct Bot {
 }
 
 struct BotInner {
-    /// None = cold (proxied, never connected) or disconnected.
+    /// None = disconnected (relog will reconnect).
     session: Option<BotSession>,
     /// Rate limiting: when was the last GC request sent.
     last_request: Instant,
     /// Health tracking: consecutive GC timeouts.
     consecutive_timeouts: u32,
-    /// Cooldown for on-demand connect failures (proxied bots only).
-    last_connect_failure: Option<Instant>,
 }
 
 enum BotKind {
-    /// Connects directly to Steam CM servers. Pre-warmed at startup, relogged periodically.
+    /// Connects directly to Steam CM servers.
     Direct,
-    /// Connects through a proxy. Cold-started, connects on-demand when needed for inspect.
+    /// Connects through a SOCKS5/HTTP proxy.
     Proxied(ProxyInfo),
 }
 
@@ -200,8 +209,8 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 // ============================================================================
 
 impl BotPool {
-    /// Initialize the bot pool: load credentials, connect direct bots, register proxied bots cold.
-    /// Direct bots are pre-warmed at startup. Proxied bots connect on-demand during first inspect.
+    /// Initialize the bot pool: load credentials, register all bots cold, then warm them up.
+    /// All bots (direct and proxied) are eagerly connected at startup and relogged periodically.
     pub async fn new(config: &InspectConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let bots_json = std::fs::read_to_string(&config.bots_config_path)
             .map_err(|e| format!("Failed to read bots config at {}: {}", config.bots_config_path, e))?;
@@ -232,84 +241,36 @@ impl BotPool {
             );
         }
 
-        // Only discover CM servers if we have direct bots to connect
-        let server_list = if proxies.is_empty() {
-            info!("Discovering Steam CM servers...");
-            Some(ServerList::discover().await?)
-        } else {
-            None
-        };
-
+        // Register all bots cold (session: None) — warmup connects them in parallel
         let mut bots = Vec::new();
         let total = bots_config.bots.len();
 
         for (i, creds) in bots_config.bots.iter().enumerate() {
-            if proxies.is_empty() {
-                // Direct bot — pre-warm connection at startup
-                info!(
-                    "Connecting bot {}/{}: {} via direct",
-                    i + 1, total, creds.username,
-                );
-
-                match Self::connect_session_with_retry(
-                    server_list.as_ref().unwrap(),
-                    creds,
-                    None,
-                )
-                .await
-                {
-                    Ok(session) => {
-                        info!("Bot {} ({}) connected to CS2 GC", i, creds.username);
-                        bots.push(Arc::new(Bot {
-                            inner: Mutex::new(BotInner {
-                                session: Some(session),
-                                last_request: Instant::now() - Duration::from_secs(10),
-                                consecutive_timeouts: 0,
-                                last_connect_failure: None,
-                            }),
-                            username: creds.username.clone(),
-                            index: i,
-                            kind: BotKind::Direct,
-                        }));
-                    }
-                    Err(e) => {
-                        error!("Bot {} ({}) failed to connect: {}", i, creds.username, e);
-                    }
-                }
+            let kind = if proxies.is_empty() {
+                BotKind::Direct
             } else {
-                // Proxied bot — register cold, will connect on-demand
                 let proxy = proxies[i % proxies.len()].clone();
                 let proto = match proxy.protocol {
                     ProxyProtocol::Socks5 => "socks5",
                     ProxyProtocol::Http => "http",
                 };
                 info!(
-                    "Bot {}/{}: {} registered (proxied via {} {}:{}, will connect on demand)",
+                    "Bot {}/{}: {} assigned proxy {} {}:{}",
                     i + 1, total, creds.username, proto, proxy.host, proxy.port,
                 );
+                BotKind::Proxied(proxy)
+            };
 
-                bots.push(Arc::new(Bot {
-                    inner: Mutex::new(BotInner {
-                        session: None,
-                        last_request: Instant::now() - Duration::from_secs(10),
-                        consecutive_timeouts: 0,
-                        last_connect_failure: None,
-                    }),
-                    username: creds.username.clone(),
-                    index: i,
-                    kind: BotKind::Proxied(proxy),
-                }));
-            }
-        }
-
-        if bots.is_empty() {
-            return Err("All bots failed to connect — inspect disabled".into());
-        }
-
-        if proxies.is_empty() {
-            info!("{}/{} bots connected to CS2 GC", bots.len(), total);
-        } else {
-            info!("{} proxied bots registered (will connect on demand)", bots.len());
+            bots.push(Arc::new(Bot {
+                inner: Mutex::new(BotInner {
+                    session: None,
+                    last_request: Instant::now() - Duration::from_secs(10),
+                    consecutive_timeouts: 0,
+                }),
+                username: creds.username.clone(),
+                index: i,
+                kind,
+            }));
         }
 
         let pool = Self {
@@ -317,12 +278,125 @@ impl BotPool {
             next: AtomicUsize::new(0),
             config: config.clone(),
             bots_config: bots_config.clone(),
+            server_list_cache: Arc::new(tokio::sync::RwLock::new(None)),
         };
 
-        // Spawn periodic relog tasks (direct bots only)
+        // Eagerly warm up ALL bots (parallel batches)
+        pool.warmup_all_bots().await;
+
+        if pool.ready_count() == 0 {
+            return Err("All bots failed to connect — inspect disabled".into());
+        }
+
+        // Spawn periodic relog tasks for ALL bots
         pool.spawn_relog_tasks();
 
         Ok(pool)
+    }
+
+    /// Get cached CM server list, refreshing if stale (>5 min).
+    async fn get_or_refresh_server_list(
+        cache: &tokio::sync::RwLock<Option<(Arc<ServerList>, Instant)>>,
+    ) -> Result<Arc<ServerList>, Box<dyn std::error::Error + Send + Sync>> {
+        // Fast path: read lock
+        {
+            let cached = cache.read().await;
+            if let Some((ref list, ref fetched_at)) = *cached {
+                if fetched_at.elapsed() < SERVER_LIST_CACHE_TTL {
+                    return Ok(Arc::clone(list));
+                }
+            }
+        }
+        // Slow path: write lock + discover
+        let mut cached = cache.write().await;
+        // Double-check (another task may have refreshed while we waited)
+        if let Some((ref list, ref fetched_at)) = *cached {
+            if fetched_at.elapsed() < SERVER_LIST_CACHE_TTL {
+                return Ok(Arc::clone(list));
+            }
+        }
+        info!("Discovering Steam CM servers...");
+        let server_list = Arc::new(ServerList::discover().await?);
+        *cached = Some((Arc::clone(&server_list), Instant::now()));
+        Ok(server_list)
+    }
+
+    /// Warm up all bots in parallel batches at startup.
+    async fn warmup_all_bots(&self) {
+        let server_list = match Self::get_or_refresh_server_list(&self.server_list_cache).await {
+            Ok(sl) => sl,
+            Err(e) => {
+                error!("Failed to discover CM servers for warmup: {}", e);
+                return;
+            }
+        };
+
+        let total = self.bots.len();
+        let mut connected = 0usize;
+        let mut failed = 0usize;
+
+        for batch in self.bots.chunks(WARMUP_BATCH_SIZE) {
+            let mut handles = Vec::new();
+
+            for bot in batch {
+                let bot = Arc::clone(bot);
+                let server_list = Arc::clone(&server_list);
+                let creds = self.bots_config.bots[bot.index].clone();
+                let proxy = match &bot.kind {
+                    BotKind::Proxied(p) => Some(p.clone()),
+                    BotKind::Direct => None,
+                };
+
+                handles.push(tokio::spawn(async move {
+                    let result = tokio::time::timeout(
+                        WARMUP_CONNECT_TIMEOUT,
+                        BotPool::connect_session_with_retry(&server_list, &creds, proxy.as_ref()),
+                    )
+                    .await;
+
+                    match result {
+                        Ok(Ok(session)) => {
+                            let mut inner = bot.inner.lock().await;
+                            inner.session = Some(session);
+                            info!(bot = %bot.username, "Warmup: connected to CS2 GC");
+                            true
+                        }
+                        Ok(Err(e)) => {
+                            error!(bot = %bot.username, error = %e, "Warmup: connection failed");
+                            false
+                        }
+                        Err(_) => {
+                            error!(
+                                bot = %bot.username,
+                                "Warmup: timed out after {}s",
+                                WARMUP_CONNECT_TIMEOUT.as_secs(),
+                            );
+                            false
+                        }
+                    }
+                }));
+            }
+
+            for handle in handles {
+                match handle.await {
+                    Ok(true) => connected += 1,
+                    Ok(false) => failed += 1,
+                    Err(e) => {
+                        error!("Warmup task panicked: {}", e);
+                        failed += 1;
+                    }
+                }
+            }
+        }
+
+        info!(
+            connected,
+            failed,
+            total,
+            "Warmup complete: {}/{} bots connected",
+            connected,
+            total,
+        );
     }
 
     /// Connect a bot session with retry logic. First attempt may kick an existing session
@@ -562,47 +636,19 @@ impl BotPool {
         }
     }
 
-    /// Connect a proxied bot on-demand (no retries — fail fast, cooldown handles backoff).
-    /// Discovers fresh CM servers and establishes a full session through the proxy.
-    async fn connect_on_demand(
-        username: &str,
-        proxy: &ProxyInfo,
-        creds: &BotCredentials,
-    ) -> Result<BotSession, Box<dyn std::error::Error + Send + Sync>> {
-        let start = Instant::now();
-        let proto = match proxy.protocol {
-            ProxyProtocol::Socks5 => "socks5",
-            ProxyProtocol::Http => "http",
-        };
-        info!(
-            bot = %username,
-            proxy = %format!("{} {}:{}", proto, proxy.host, proxy.port),
-            "On-demand connect starting"
-        );
-
-        let server_list = ServerList::discover().await?;
-        let session = Self::connect_session(&server_list, creds, Some(proxy)).await?;
-
-        info!(
-            bot = %username,
-            duration_ms = start.elapsed().as_millis() as u64,
-            "On-demand connect succeeded"
-        );
-        Ok(session)
-    }
-
-    /// Spawn periodic relog tasks for direct bots only (CSFloat pattern).
+    /// Spawn periodic relog tasks for ALL bots (direct and proxied).
     /// Every ~30 min (+ random variance), reconnect the bot to prevent stale GC sessions.
-    /// Proxied bots don't need relog — they connect on-demand and drop dead sessions.
     fn spawn_relog_tasks(&self) {
-        for bot in &self.bots {
-            // Only relog direct bots
-            if !matches!(bot.kind, BotKind::Direct) {
-                continue;
-            }
+        let cache = Arc::clone(&self.server_list_cache);
 
+        for bot in &self.bots {
             let bot = Arc::clone(bot);
             let creds = self.bots_config.bots[bot.index].clone();
+            let cache = Arc::clone(&cache);
+            let proxy = match &bot.kind {
+                BotKind::Proxied(p) => Some(p.clone()),
+                BotKind::Direct => None,
+            };
 
             tokio::spawn(async move {
                 // Stagger relog times (CSFloat uses 0-4 min variance)
@@ -614,32 +660,28 @@ impl BotPool {
 
                     info!(
                         bot = %bot.username,
-                        "Periodic relog: reconnecting bot (interval={}min)",
+                        "Periodic relog: reconnecting (interval={}min)",
                         interval.as_secs() / 60,
                     );
 
                     // Clear session to prevent inspects from using stale connection during relog.
-                    // Direct bot with session=None is skipped by inspect_with_next_bot.
                     {
                         let mut inner = bot.inner.lock().await;
                         inner.session = None;
                     }
 
-                    // Discover fresh CM servers for relog
-                    let server_list = match ServerList::discover().await {
+                    let server_list = match BotPool::get_or_refresh_server_list(&cache).await {
                         Ok(sl) => sl,
                         Err(e) => {
                             error!(bot = %bot.username, error = %e, "Relog failed: CM discovery error");
-                            // Bot stays with session=None — next relog cycle will retry
                             continue;
                         }
                     };
 
-                    // Direct bots have no proxy
                     match BotPool::connect_session_with_retry(
                         &server_list,
                         &creds,
-                        None,
+                        proxy.as_ref(),
                     )
                     .await
                     {
@@ -647,11 +689,10 @@ impl BotPool {
                             let mut inner = bot.inner.lock().await;
                             inner.session = Some(new_session);
                             inner.consecutive_timeouts = 0;
-                            info!(bot = %bot.username, "Relog successful — bot reconnected to CS2 GC");
+                            info!(bot = %bot.username, "Relog successful");
                         }
                         Err(e) => {
                             error!(bot = %bot.username, error = %e, "Relog failed — bot stays offline");
-                            // Bot stays with session=None — next relog cycle will retry
                         }
                     }
                 }
@@ -674,6 +715,9 @@ impl BotPool {
                         "Inspect attempt failed, retrying with next bot"
                     );
                     last_error = Some(e);
+                    if attempt + 1 < self.config.max_retries {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
                 }
             }
         }
@@ -704,40 +748,9 @@ impl BotPool {
                 Err(_) => continue,
             };
 
-            // Ensure session exists
+            // No session = disconnected (relog will reconnect), skip
             if inner.session.is_none() {
-                match &bot.kind {
-                    BotKind::Direct => {
-                        // Direct bot without session = broken (relog will fix), skip
-                        continue;
-                    }
-                    BotKind::Proxied(proxy) => {
-                        // Cooldown check: don't retry a recently-failed proxy
-                        if let Some(fail_time) = inner.last_connect_failure {
-                            if fail_time.elapsed() < ON_DEMAND_CONNECT_COOLDOWN {
-                                continue;
-                            }
-                        }
-                        // On-demand connect (holds lock — other requests skip this bot)
-                        match Self::connect_on_demand(
-                            &bot.username,
-                            proxy,
-                            &self.bots_config.bots[bot.index],
-                        )
-                        .await
-                        {
-                            Ok(session) => {
-                                inner.session = Some(session);
-                                inner.last_connect_failure = None;
-                            }
-                            Err(e) => {
-                                warn!(bot = %bot.username, error = %e, "On-demand connect failed");
-                                inner.last_connect_failure = Some(Instant::now());
-                                continue;
-                            }
-                        }
-                    }
-                }
+                continue;
             }
 
             // Rate limit (Steam enforces ~1100ms between requests)
@@ -758,45 +771,39 @@ impl BotPool {
                     inner.consecutive_timeouts = 0;
                 }
                 Err(InspectError::Timeout) => {
-                    inner.consecutive_timeouts += 1;
-                    if inner.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
-                        if matches!(bot.kind, BotKind::Proxied(_)) {
-                            // Proxied: drop dead session, reconnect on next request
-                            inner.session = None;
-                            inner.consecutive_timeouts = 0;
-                            warn!(
-                                bot = %bot.username,
-                                "Proxied bot session dropped after {} consecutive timeouts",
-                                MAX_CONSECUTIVE_TIMEOUTS,
-                            );
-                        } else {
-                            // Direct: stays broken until relog fixes it
+                    if matches!(bot.kind, BotKind::Proxied(_)) {
+                        // Proxied: single timeout = dead proxy session, drop immediately
+                        inner.session = None;
+                        inner.consecutive_timeouts = 0;
+                        warn!(bot = %bot.username, "Proxied bot session dropped on first GC timeout");
+                    } else {
+                        // Direct: existing 3-consecutive-timeout logic
+                        inner.consecutive_timeouts += 1;
+                        if inner.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
                             error!(
                                 bot = %bot.username,
                                 consecutive = inner.consecutive_timeouts,
                                 "Direct bot marked unhealthy after {} consecutive timeouts",
                                 MAX_CONSECUTIVE_TIMEOUTS,
                             );
+                        } else {
+                            warn!(
+                                bot = %bot.username,
+                                consecutive = inner.consecutive_timeouts,
+                                "GC inspect timed out"
+                            );
                         }
-                    } else {
-                        warn!(
-                            bot = %bot.username,
-                            consecutive = inner.consecutive_timeouts,
-                            "GC inspect timed out"
-                        );
                     }
                 }
                 Err(InspectError::SendFailed(_) | InspectError::ReceiveFailed(_)) => {
-                    if matches!(bot.kind, BotKind::Proxied(_)) {
-                        // Proxied: connection is dead, drop it for on-demand reconnect
-                        inner.session = None;
-                        inner.consecutive_timeouts = 0;
-                        warn!(
-                            bot = %bot.username,
-                            error = %result.as_ref().unwrap_err(),
-                            "Proxied bot session dropped after send/receive failure"
-                        );
-                    }
+                    // Connection is dead, drop session (relog will reconnect)
+                    inner.session = None;
+                    inner.consecutive_timeouts = 0;
+                    warn!(
+                        bot = %bot.username,
+                        error = %result.as_ref().unwrap_err(),
+                        "Bot session dropped after send/receive failure"
+                    );
                 }
                 _ => {}
             }

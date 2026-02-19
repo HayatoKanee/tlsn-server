@@ -198,7 +198,7 @@ fn default_request_delay_ms() -> u64 {
 }
 
 fn default_request_timeout_s() -> u64 {
-    15
+    2
 }
 
 fn default_max_retries() -> u32 {

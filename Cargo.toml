@@ -77,6 +77,9 @@ libc = "0.2"
 steam-vent = { version = "0.4", features = ["csgo"] }
 steam-vent-proto-csgo = "0.5"
 
+# LRU cache for inspect results
+lru = "0.12"
+
 # SOCKS5 proxy for Steam bot connections
 tokio-socks = "0.5"
 
