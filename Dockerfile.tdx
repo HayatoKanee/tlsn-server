@@ -5,13 +5,12 @@
 #
 # Run (requires TDX VM with configfs or /dev/tdx_guest):
 #   docker run -d -p 7047:7047 \
-#     --privileged \
+#     --device /dev/tdx_guest \
 #     -v /sys/kernel/config:/sys/kernel/config \
+#     -v /path/to/bots.json:/app/bots.json:ro \
 #     tlsn-server-tdx
 #
-# --privileged is needed for:
-#   - /sys/kernel/config/tsm/report (configfs quote generation)
-#   - /dev/tdx_guest (Azure IMDS fallback)
+# Secrets (bots.json) are mounted at runtime, NEVER baked into the image.
 
 FROM rust:bookworm AS builder
 WORKDIR /app
@@ -24,7 +23,5 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 WORKDIR /app
 COPY --from=builder /app/target/release/tlsn-server .
 COPY config-tdx.yaml config.yaml
-COPY notary.key .
-COPY bots.json .
 EXPOSE 7047
 ENTRYPOINT ["./tlsn-server", "--config", "config.yaml"]

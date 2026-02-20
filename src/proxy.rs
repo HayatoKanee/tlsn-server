@@ -1,13 +1,28 @@
 use axum::{
     extract::{Query, WebSocketUpgrade},
     extract::ws::{Message, WebSocket},
+    http::StatusCode,
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// Allowed proxy target hosts (Steam servers only).
+/// The proxy exists so browser extensions can reach Steam CM servers
+/// via WebSocket (browsers can't open raw TCP).
+const ALLOWED_HOSTS: &[&str] = &[
+    "api.steampowered.com",
+    "steamcommunity.com",
+    "community.steam-api.com",
+    "login.steampowered.com",
+    "store.steampowered.com",
+];
+
+/// Maximum allowed port range.
+const ALLOWED_PORT_RANGE: std::ops::RangeInclusive<u16> = 80..=65535;
 
 /// Query parameters for proxy WebSocket connection.
 /// Supports both `token` (notary.pse.dev compatible) and `host` (legacy).
@@ -18,46 +33,88 @@ pub struct ProxyQuery {
 }
 
 /// WebSocket proxy handler — bridges WebSocket to TCP for browser clients.
+///
+/// Security: Only allows connections to allowlisted Steam servers.
 pub async fn proxy_ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<ProxyQuery>,
-) -> impl IntoResponse {
-    let host = query.token;
-    info!("[Proxy] New proxy request for host: {}", host);
-    ws.on_upgrade(move |socket| handle_proxy_connection(socket, host))
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let host = &query.token;
+
+    // Parse host:port
+    let (hostname, port) = parse_host_port(host);
+
+    // Validate against allowlist
+    if !is_allowed_host(&hostname) {
+        warn!(host = %host, "Proxy request rejected: host not in allowlist");
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("Host not allowed: {hostname}. Only Steam servers are permitted."),
+        ));
+    }
+
+    if !ALLOWED_PORT_RANGE.contains(&port) {
+        warn!(host = %host, port, "Proxy request rejected: port out of range");
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("Port {port} not allowed"),
+        ));
+    }
+
+    info!("[Proxy] Approved proxy request for {}:{}", hostname, port);
+    let hostname_owned = hostname.to_string();
+    Ok(ws.on_upgrade(move |socket| handle_proxy_connection(socket, hostname_owned, port)))
+}
+
+/// Parse host:port string, defaulting to port 443.
+fn parse_host_port(host: &str) -> (String, u16) {
+    if let Some(colon_pos) = host.rfind(':') {
+        let hostname = host[..colon_pos].to_string();
+        let port = host[colon_pos + 1..].parse().unwrap_or(443);
+        (hostname, port)
+    } else {
+        (host.to_string(), 443)
+    }
+}
+
+/// Check if hostname is in the Steam allowlist.
+fn is_allowed_host(hostname: &str) -> bool {
+    let hostname_lower = hostname.to_lowercase();
+    ALLOWED_HOSTS
+        .iter()
+        .any(|allowed| hostname_lower == *allowed)
 }
 
 /// Handle the proxy WebSocket connection by bridging to TCP.
-async fn handle_proxy_connection(ws: WebSocket, host: String) {
+async fn handle_proxy_connection(ws: WebSocket, hostname: String, port: u16) {
     let proxy_id = Uuid::new_v4().to_string();
-    info!("[{}] Proxy WebSocket connected for host: {}", proxy_id, host);
+    info!("[{}] Proxy WebSocket connected for {}:{}", proxy_id, hostname, port);
 
-    // Parse host and port (default to 443 for HTTPS).
-    let (hostname, port) = if host.contains(':') {
-        let parts: Vec<&str> = host.split(':').collect();
-        (
-            parts[0].to_string(),
-            parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(443u16),
-        )
-    } else {
-        (host.clone(), 443)
-    };
-
-    info!("[{}] Connecting to {}:{}", proxy_id, hostname, port);
-
-    // Connect to the remote TCP host.
-    let tcp_stream = match tokio::net::TcpStream::connect((hostname.as_str(), port)).await {
-        Ok(stream) => {
+    // Connect to the remote TCP host with timeout.
+    let tcp_stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::TcpStream::connect((hostname.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
             info!(
                 "[{}] TCP connection established to {}:{}",
                 proxy_id, hostname, port
             );
             stream
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!(
                 "[{}] Failed to connect to {}:{} - {}",
                 proxy_id, hostname, port, e
+            );
+            return;
+        }
+        Err(_) => {
+            error!(
+                "[{}] TCP connect timeout to {}:{} (10s)",
+                proxy_id, hostname, port
             );
             return;
         }
@@ -151,4 +208,35 @@ async fn handle_proxy_connection(ws: WebSocket, host: String) {
         "[{}] Proxy closed: WS->TCP {} bytes, TCP->WS {} bytes",
         proxy_id, ws_total, tcp_total
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allowed_hosts() {
+        assert!(is_allowed_host("api.steampowered.com"));
+        assert!(is_allowed_host("steamcommunity.com"));
+        assert!(is_allowed_host("API.STEAMPOWERED.COM"));
+        assert!(!is_allowed_host("evil.com"));
+        assert!(!is_allowed_host("169.254.169.254"));
+        assert!(!is_allowed_host("localhost"));
+        assert!(!is_allowed_host("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_parse_host_port() {
+        let (h, p) = parse_host_port("api.steampowered.com:443");
+        assert_eq!(h, "api.steampowered.com");
+        assert_eq!(p, 443);
+
+        let (h, p) = parse_host_port("steamcommunity.com");
+        assert_eq!(h, "steamcommunity.com");
+        assert_eq!(p, 443);
+
+        let (h, p) = parse_host_port("example.com:8080");
+        assert_eq!(h, "example.com");
+        assert_eq!(p, 8080);
+    }
 }

@@ -108,7 +108,7 @@ pub struct TradeOfferData {
 #[derive(Debug, Clone)]
 pub struct TradeStatusData {
     pub status: u32,
-    pub partner_steam_id: u64,
+    pub partner_steam_id: Option<u64>,
     pub asset_id_given: Option<u64>,
     pub asset_id: Option<u64>,
     pub time_settlement: Option<u64>,

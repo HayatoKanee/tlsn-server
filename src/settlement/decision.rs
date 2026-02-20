@@ -39,11 +39,6 @@ pub fn fault_for_declined(seller_created_offer: bool) -> RefundReason {
     }
 }
 
-/// Returns true for non-terminal states that should not be submitted as proofs.
-pub fn is_non_terminal_state(state: u32) -> bool {
-    !matches!(state, 5 | 6 | 7 | 8 | 10)
-}
-
 /// Determine who created the offer based on is_our_offer and capturer identity.
 ///
 /// # Arguments
@@ -112,25 +107,6 @@ mod tests {
     #[test]
     fn test_buyer_captures_buyer_created_offer() {
         assert!(!determine_seller_created_offer(false, true));
-    }
-
-    #[test]
-    fn test_terminal_states() {
-        assert!(!is_non_terminal_state(5));
-        assert!(!is_non_terminal_state(6));
-        assert!(!is_non_terminal_state(7));
-        assert!(!is_non_terminal_state(8));
-        assert!(!is_non_terminal_state(10));
-    }
-
-    #[test]
-    fn test_non_terminal_states_should_panic() {
-        assert!(is_non_terminal_state(1));
-        assert!(is_non_terminal_state(2));
-        assert!(is_non_terminal_state(3));
-        assert!(is_non_terminal_state(4));
-        assert!(is_non_terminal_state(9));
-        assert!(is_non_terminal_state(11));
     }
 
     #[test]

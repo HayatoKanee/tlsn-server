@@ -99,9 +99,24 @@ pub fn decide(
         return Err(SettlementError::InvalidServer(server_name.to_string()));
     }
 
-    // 2. Detect proof source from request URL
+    // 2. Detect proof source from request URL, cross-validated with server_name
     let proof_source = detect_proof_source(sent_bytes)
         .ok_or(SettlementError::UnknownProofSource)?;
+
+    // Cross-validate: API proof sources must come from API host, community from community host
+    match proof_source {
+        ProofSource::TradeOffer | ProofSource::TradeStatus if server_name != STEAM_API_HOST => {
+            return Err(SettlementError::InvalidServer(format!(
+                "API proof source {:?} from non-API host: {}", proof_source, server_name
+            )));
+        }
+        ProofSource::Community if server_name != STEAM_COMMUNITY_HOST => {
+            return Err(SettlementError::InvalidServer(format!(
+                "Community proof from non-community host: {}", server_name
+            )));
+        }
+        _ => {}
+    }
 
     // 3. Extract HTTP body and parse
     let body = extract_http_body(recv_bytes)
@@ -172,17 +187,16 @@ fn decide_trade_offer(
         data.asset_to_receive
     };
 
-    if proof_asset_id.is_none() {
+    let Some(proof_asset_id) = proof_asset_id else {
         return Ok(Settlement {
             asset_id: escrow.asset_id,
             trade_offer_id: escrow.trade_offer_id,
             decision: Decision::Refund,
             refund_reason: RefundReason::NotCS2Item,
         });
-    }
+    };
 
     // ⑤ assetId must match escrow
-    let proof_asset_id = proof_asset_id.unwrap();
     if proof_asset_id != escrow.asset_id {
         return Ok(Settlement {
             asset_id: escrow.asset_id,
@@ -241,15 +255,18 @@ fn decide_trade_status(
         3 => {
             // ① assetId must be in assets_given (seller sent the CS2 item)
             // Use asset_id_given, NOT asset_id — verifies seller actually SENT the item
-            let proof_asset_id = data.asset_id_given;
-            if proof_asset_id.is_none() || proof_asset_id.unwrap() != escrow.asset_id {
+            if data.asset_id_given != Some(escrow.asset_id) {
                 return Err(SettlementError::InvalidReleaseProof {
                     asset_id: escrow.asset_id,
                 });
             }
 
-            // ② steamid_other must be buyer
-            if data.partner_steam_id != escrow.buyer_steam_id {
+            // ② steamid_other must be buyer (required for Release)
+            let partner_steam_id = data.partner_steam_id
+                .ok_or(SettlementError::ParseFailed(ParseError::JsonParse(
+                    "Missing steamid_other in completed trade".into()
+                )))?;
+            if partner_steam_id != escrow.buyer_steam_id {
                 return Ok(Settlement {
                     asset_id: escrow.asset_id,
                     trade_offer_id: escrow.trade_offer_id,
@@ -280,11 +297,10 @@ fn decide_trade_status(
         // REFUND PATH: Deprecated rollback states (4-9, 11)
         4 | 5 | 6 | 7 | 8 | 9 | 11 => {
             // Validate asset is in trade
-            let proof_asset_id = data.asset_id;
-            if proof_asset_id.is_none() || proof_asset_id.unwrap() != escrow.asset_id {
+            if data.asset_id != Some(escrow.asset_id) {
                 return Err(SettlementError::AssetIdMismatch {
                     expected: escrow.asset_id,
-                    got: proof_asset_id,
+                    got: data.asset_id,
                 });
             }
 
@@ -299,11 +315,10 @@ fn decide_trade_status(
         // REFUND PATH (status == 12 Rollback)
         12 => {
             // Validate asset is in trade
-            let proof_asset_id = data.asset_id;
-            if proof_asset_id.is_none() || proof_asset_id.unwrap() != escrow.asset_id {
+            if data.asset_id != Some(escrow.asset_id) {
                 return Err(SettlementError::AssetIdMismatch {
                     expected: escrow.asset_id,
-                    got: proof_asset_id,
+                    got: data.asset_id,
                 });
             }
 

@@ -69,6 +69,16 @@ pub async fn inspect_item(
         .as_ref()
         .ok_or(InspectError::NoItemInfo)?;
 
+    // Validate response matches requested asset (defense against stale/unsolicited GC messages)
+    if let Some(returned_id) = item.itemid {
+        if returned_id != params.a {
+            return Err(InspectError::WrongAsset {
+                expected: params.a,
+                got: returned_id,
+            });
+        }
+    }
+
     // paintwear (u32 IEEE 754 bit pattern) → f32
     let paintwear_raw = item.paintwear.unwrap_or(0);
     let floatvalue = f32::from_bits(paintwear_raw);
@@ -123,6 +133,7 @@ pub enum InspectError {
     ReceiveFailed(String),
     Timeout,
     NoItemInfo,
+    WrongAsset { expected: u64, got: u64 },
     NoBots,
 }
 
@@ -133,6 +144,9 @@ impl std::fmt::Display for InspectError {
             Self::ReceiveFailed(e) => write!(f, "Failed to receive GC response: {}", e),
             Self::Timeout => write!(f, "GC request timed out"),
             Self::NoItemInfo => write!(f, "No item info in GC response"),
+            Self::WrongAsset { expected, got } => {
+                write!(f, "GC response asset mismatch: expected {expected}, got {got}")
+            }
             Self::NoBots => write!(f, "No bots available"),
         }
     }

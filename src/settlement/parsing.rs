@@ -13,7 +13,6 @@ use miniz_oxide::inflate::decompress_to_vec;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     NoJsonBody,
-    NoHtmlBody,
     InvalidGzip,
     UnsupportedCompression,
     InvalidGzipHeader,
@@ -41,7 +40,6 @@ impl ParseError {
     pub fn as_str(&self) -> &str {
         match self {
             ParseError::NoJsonBody => "No JSON body found",
-            ParseError::NoHtmlBody => "No HTML body found",
             ParseError::InvalidGzip => "Not a valid gzip stream",
             ParseError::UnsupportedCompression => "Unsupported compression method",
             ParseError::InvalidGzipHeader => "Invalid gzip header",
@@ -303,8 +301,7 @@ pub fn parse_trade_status(json: &str) -> Result<TradeStatusData, ParseError> {
     let trade = trades.into_iter().next().ok_or(ParseError::TradeNotFound)?;
 
     let partner_steam_id = trade.steamid_other
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
+        .and_then(|s| s.parse::<u64>().ok());
 
     let asset_id_given = first_cs2_status_assetid(&trade.assets_given);
     let asset_id = first_cs2_status_assetid(&trade.assets_received)
@@ -317,18 +314,6 @@ pub fn parse_trade_status(json: &str) -> Result<TradeStatusData, ParseError> {
         asset_id,
         time_settlement: trade.time_settlement,
     })
-}
-
-/// Parse GetTradeOffer response from raw HTTP bytes
-pub fn parse_trade_offer_response(response: &[u8]) -> Result<TradeOfferData, ParseError> {
-    let json_str = extract_http_body(response)?;
-    parse_trade_offer(&json_str)
-}
-
-/// Parse GetTradeStatus response from raw HTTP bytes
-pub fn parse_trade_status_response(response: &[u8]) -> Result<TradeStatusData, ParseError> {
-    let json_str = extract_http_body(response)?;
-    parse_trade_status(&json_str)
 }
 
 // ============================================================================
@@ -417,9 +402,20 @@ pub fn parse_community_html(
     })
 }
 
-/// Extract Steam ID from steamLoginSecure cookie
+/// Extract Steam ID from steamLoginSecure cookie.
+///
+/// Restricts search to `Cookie:` header line to prevent injection via URL query params.
 pub fn extract_steam_id_from_cookie(request: &[u8]) -> Result<u64, ParseError> {
-    let cookie_start = find_pattern(request, b"steamLoginSecure=")
+    // Find the Cookie header line (not URL/body)
+    let cookie_header_pos = find_pattern(request, b"\r\nCookie:")
+        .ok_or(ParseError::MissingCookie)?;
+    let header_start = cookie_header_pos + 2; // skip \r\n
+    let header_end = find_pattern(&request[header_start..], b"\r\n")
+        .map(|pos| header_start + pos)
+        .unwrap_or(request.len());
+    let cookie_line = &request[header_start..header_end];
+
+    let cookie_start = find_pattern(cookie_line, b"steamLoginSecure=")
         .ok_or(ParseError::MissingCookie)?;
 
     let value_start = cookie_start + b"steamLoginSecure=".len();
@@ -428,12 +424,12 @@ pub fn extract_steam_id_from_cookie(request: &[u8]) -> Result<u64, ParseError> {
     let mut i = value_start;
     let mut digit_count = 0;
 
-    while i < request.len() && request[i].is_ascii_digit() {
+    while i < cookie_line.len() && cookie_line[i].is_ascii_digit() {
         digit_count += 1;
         if digit_count > 20 {
             return Err(ParseError::NumberOverflow);
         }
-        let digit = (request[i] - b'0') as u64;
+        let digit = (cookie_line[i] - b'0') as u64;
         steam_id = steam_id.checked_mul(10)
             .and_then(|n| n.checked_add(digit))
             .ok_or(ParseError::NumberOverflow)?;
@@ -444,8 +440,8 @@ pub fn extract_steam_id_from_cookie(request: &[u8]) -> Result<u64, ParseError> {
         return Err(ParseError::InvalidCookieFormat);
     }
 
-    let has_delimiter = (i + 6 <= request.len() && &request[i..i+6] == b"%7C%7C")
-        || (i + 2 <= request.len() && &request[i..i+2] == b"||");
+    let has_delimiter = (i + 6 <= cookie_line.len() && &cookie_line[i..i+6] == b"%7C%7C")
+        || (i + 2 <= cookie_line.len() && &cookie_line[i..i+2] == b"||");
 
     if !has_delimiter {
         return Err(ParseError::InvalidCookieFormat);
@@ -588,7 +584,7 @@ mod tests {
         let json = r#"{"response":{"trades":[{"tradeid":"698750883296824050","steamid_other":"76561198404282737","status":3,"assets_given":[{"appid":730,"assetid":"44815125678"}],"time_settlement":1766476800}]}}"#;
         let result = parse_trade_status(json).unwrap();
         assert_eq!(result.status, 3);
-        assert_eq!(result.partner_steam_id, 76561198404282737);
+        assert_eq!(result.partner_steam_id, Some(76561198404282737));
         assert_eq!(result.asset_id_given, Some(44815125678));
         assert_eq!(result.time_settlement, Some(1766476800));
     }

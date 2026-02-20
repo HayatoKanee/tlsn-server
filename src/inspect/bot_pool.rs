@@ -125,11 +125,21 @@ pub struct BotsConfig {
     pub proxies: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct BotCredentials {
     pub username: String,
     pub password: String,
     pub shared_secret: String,
+}
+
+impl std::fmt::Debug for BotCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BotCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("shared_secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 // ============================================================================
@@ -651,11 +661,14 @@ impl BotPool {
             };
 
             tokio::spawn(async move {
-                // Stagger relog times (CSFloat uses 0-4 min variance)
-                let variance = rand_u64() % RELOG_VARIANCE_SECS;
-                let interval = RELOG_INTERVAL + Duration::from_secs(variance);
+                // Stagger relog times per bot using index-seeded variance.
+                // Recompute each iteration to avoid synchronized relog storms.
+                let bot_index = bot.index as u64;
 
                 loop {
+                    let variance = (rand_u64() ^ bot_index.wrapping_mul(0x9e3779b97f4a7c15))
+                        % RELOG_VARIANCE_SECS;
+                    let interval = RELOG_INTERVAL + Duration::from_secs(variance);
                     tokio::time::sleep(interval).await;
 
                     info!(

@@ -198,6 +198,18 @@ struct ImdsQuoteResponse {
     quote: String,
 }
 
+/// Reusable HTTP client for Azure IMDS requests.
+static IMDS_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn imds_client() -> &'static reqwest::Client {
+    IMDS_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to build IMDS HTTP client")
+    })
+}
+
 /// Generate a quote via Azure IMDS.
 ///
 /// 1. Get a TD report with custom report_data via `/dev/tdx_guest` ioctl
@@ -207,8 +219,7 @@ async fn generate_quote_azure_imds(report_data: &[u8; 64]) -> eyre::Result<Vec<u
     let td_report = get_td_report(report_data)?;
 
     // Step 2: Send TD report to Azure IMDS for signing
-    let client = reqwest::Client::new();
-    let response = client
+    let response = imds_client()
         .post(AZURE_IMDS_QUOTE_URL)
         .json(&serde_json::json!({
             "report": URL_SAFE_NO_PAD.encode(&td_report)

@@ -11,11 +11,14 @@
 //! cannot cause incorrect settlement because tradeOfferId binding (committed
 //! on-chain by seller) prevents mismatch.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use alloy::primitives::Address;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::{Result, eyre};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::types::EscrowSnapshot;
 
@@ -52,6 +55,7 @@ pub struct ChainReader {
     rpc_url: String,
     jjskin_address: Address,
     factory_address: Address,
+    next_rpc_id: AtomicU64,
 }
 
 impl ChainReader {
@@ -61,10 +65,15 @@ impl ChainReader {
         factory_address: Address,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("Failed to build RPC HTTP client"),
             rpc_url,
             jjskin_address,
             factory_address,
+            next_rpc_id: AtomicU64::new(1),
         }
     }
 
@@ -170,38 +179,78 @@ impl ChainReader {
         })
     }
 
-    /// Make a raw `eth_call` JSON-RPC request.
+    /// Make a raw `eth_call` JSON-RPC request with retry on transient failures.
+    ///
+    /// Retries up to 3 times with exponential backoff (200ms, 600ms, 1800ms)
+    /// for network errors and HTTP 429/5xx. Non-retryable errors (RPC-level
+    /// revert, decode failure) fail immediately.
     async fn eth_call(&self, to: Address, data: &[u8]) -> Result<Vec<u8>> {
-        let response = self
-            .client
-            .post(&self.rpc_url)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{
-                    "to": format!("{to}"),
-                    "data": format!("0x{}", hex::encode(data))
-                }, "latest"],
-                "id": 1
-            }))
-            .send()
-            .await
-            .map_err(|e| eyre!("RPC request failed: {e}"))?;
+        const MAX_RETRIES: u32 = 3;
+        const BASE_DELAY_MS: u64 = 200;
 
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| eyre!("RPC response parse failed: {e}"))?;
+        let mut last_err = eyre!("eth_call failed");
 
-        if let Some(error) = json.get("error") {
-            return Err(eyre!("RPC error: {}", error));
+        for attempt in 0..MAX_RETRIES {
+            let rpc_id = self.next_rpc_id.fetch_add(1, Ordering::Relaxed);
+            let send_result = self
+                .client
+                .post(&self.rpc_url)
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_call",
+                    "params": [{
+                        "to": format!("{to}"),
+                        "data": format!("0x{}", hex::encode(data))
+                    }, "latest"],
+                    "id": rpc_id
+                }))
+                .send()
+                .await;
+
+            let response = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = eyre!("RPC request failed: {e}");
+                    if attempt + 1 < MAX_RETRIES {
+                        let delay = BASE_DELAY_MS * 3u64.pow(attempt);
+                        warn!(attempt = attempt + 1, delay_ms = delay, "RPC send failed, retrying");
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    continue;
+                }
+            };
+
+            // Retry on 429/5xx
+            let status = response.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error()
+            {
+                last_err = eyre!("RPC HTTP {}", status);
+                if attempt + 1 < MAX_RETRIES {
+                    let delay = BASE_DELAY_MS * 3u64.pow(attempt);
+                    warn!(attempt = attempt + 1, status = %status, delay_ms = delay, "RPC HTTP error, retrying");
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                continue;
+            }
+
+            let json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| eyre!("RPC response parse failed: {e}"))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(eyre!("RPC error: {}", error));
+            }
+
+            let result = json["result"]
+                .as_str()
+                .ok_or_else(|| eyre!("Missing 'result' in RPC response"))?;
+
+            return hex::decode(result.trim_start_matches("0x"))
+                .map_err(|e| eyre!("Failed to decode hex result: {e}"));
         }
 
-        let result = json["result"]
-            .as_str()
-            .ok_or_else(|| eyre!("Missing 'result' in RPC response"))?;
-
-        hex::decode(result.trim_start_matches("0x"))
-            .map_err(|e| eyre!("Failed to decode hex result: {e}"))
+        Err(last_err)
     }
 }

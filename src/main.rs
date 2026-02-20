@@ -39,10 +39,11 @@ use settlement::{ChainReader, OracleSigner};
 // Application State
 // ============================================================================
 
+/// Maximum concurrent sessions (prevents memory exhaustion DoS).
+const MAX_SESSIONS: usize = 100;
+
 /// Stored session data.
 struct SessionData {
-    max_sent_data: usize,
-    max_recv_data: usize,
     asset_id: u64,
 }
 
@@ -72,10 +73,6 @@ struct Args {
 
 #[derive(Debug, Deserialize)]
 struct SessionRequest {
-    #[serde(rename = "maxSentData")]
-    max_sent_data: Option<usize>,
-    #[serde(rename = "maxRecvData")]
-    max_recv_data: Option<usize>,
     /// Asset ID for on-chain escrow lookup (required).
     #[serde(rename = "assetId")]
     asset_id: u64,
@@ -136,6 +133,17 @@ async fn main() -> eyre::Result<()> {
     info!("  max_sent_data: {}", config.notarization.max_sent_data);
     info!("  max_recv_data: {}", config.notarization.max_recv_data);
     info!("  timeout: {}s", config.notarization.timeout);
+
+    // Validate contract addresses are configured (zero-address = silent settlement failure).
+    const ZERO_ADDR: &str = "0x0000000000000000000000000000000000000000";
+    if config.oracle.contract_address == ZERO_ADDR {
+        eprintln!("FATAL: oracle.contract_address is not configured (zero address)");
+        std::process::exit(1);
+    }
+    if config.oracle.steam_factory_address == ZERO_ADDR {
+        eprintln!("FATAL: oracle.steam_factory_address is not configured (zero address)");
+        std::process::exit(1);
+    }
 
     // Initialize oracle signer (required — single verifier path).
     let oracle_signer = OracleSigner::from_config(&config.oracle)?;
@@ -302,48 +310,26 @@ async fn session_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Atomic check-and-insert under a single lock to prevent TOCTOU race.
     let session_id = Uuid::new_v4().to_string();
-    let max_sent_data = body
-        .max_sent_data
-        .unwrap_or(state.config.notarization.max_sent_data);
-    let max_recv_data = body
-        .max_recv_data
-        .unwrap_or(state.config.notarization.max_recv_data);
-
-    // Enforce server limits.
-    if max_sent_data > state.config.notarization.max_sent_data {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "maxSentData {} exceeds server limit {}",
-                max_sent_data, state.config.notarization.max_sent_data
-            ),
-        ));
-    }
-    if max_recv_data > state.config.notarization.max_recv_data {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "maxRecvData {} exceeds server limit {}",
-                max_recv_data, state.config.notarization.max_recv_data
-            ),
-        ));
-    }
-
     {
         let mut sessions = state.sessions.lock().await;
+        if sessions.len() >= MAX_SESSIONS {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Server at capacity ({MAX_SESSIONS} concurrent sessions)"),
+            ));
+        }
         sessions.insert(
             session_id.clone(),
             SessionData {
-                max_sent_data,
-                max_recv_data,
                 asset_id: body.asset_id,
             },
         );
     }
     info!(
-        "[{}] Session created: assetId={}, maxSentData={}, maxRecvData={}",
-        session_id, body.asset_id, max_sent_data, max_recv_data
+        "[{}] Session created: assetId={}",
+        session_id, body.asset_id
     );
 
     // Spawn a timeout task to clean up stale sessions.

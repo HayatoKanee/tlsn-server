@@ -6,6 +6,5 @@ pub mod signer;
 pub mod types;
 
 pub use chain_reader::ChainReader;
-pub use oracle::SettlementError;
 pub use signer::OracleSigner;
 pub use types::*;

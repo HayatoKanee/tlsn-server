@@ -36,7 +36,7 @@ impl InspectCache {
 
     /// Look up a cached inspect result. Returns `None` if missing or expired.
     pub fn get(&self, inspect_link: &str) -> Option<CachedInspect> {
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let entry = cache.get(inspect_link)?;
         if entry.inserted_at.elapsed() > self.ttl {
             cache.pop(inspect_link);
@@ -59,13 +59,8 @@ impl InspectCache {
             oracle_signature,
             inserted_at: Instant::now(),
         };
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         cache.put(inspect_link, entry);
     }
 
-    /// Returns (current_len, capacity) for diagnostics.
-    pub fn stats(&self) -> (usize, usize) {
-        let cache = self.inner.lock().unwrap();
-        (cache.len(), cache.cap().get())
-    }
 }

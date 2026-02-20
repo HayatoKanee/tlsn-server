@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Server configuration loaded from YAML.
 #[derive(Debug, Clone, Deserialize)]
@@ -140,7 +140,9 @@ impl Default for OracleConfig {
 
 impl Config {
     /// Load configuration from a YAML file.
-    /// Returns default config if the file doesn't exist or can't be parsed.
+    ///
+    /// - Missing file → defaults (acceptable for dev).
+    /// - Parse error → fatal exit (prevents running with zero-address contracts).
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_yaml::from_str(&contents) {
@@ -149,8 +151,8 @@ impl Config {
                     config
                 }
                 Err(e) => {
-                    warn!("Failed to parse config file {:?}: {}", path, e);
-                    Self::default()
+                    eprintln!("FATAL: Failed to parse config file {:?}: {}", path, e);
+                    std::process::exit(1);
                 }
             },
             Err(_) => {

@@ -13,13 +13,20 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use bot_pool::BotPool;
 use cache::InspectCache;
+use futures_util::stream::{self, StreamExt as _};
 use item_detail::encode_item_detail;
 use link_parser::parse_inspect_link;
 use types::{BulkItemResponse, BulkRequest, BulkResponse, InspectData, SingleResponse};
+
+/// Maximum items per bulk request (prevents bot pool exhaustion).
+const MAX_BULK_ITEMS: usize = 100;
+
+/// Maximum concurrent GC requests per bulk call.
+const BULK_CONCURRENCY: usize = 10;
 
 use crate::settlement::OracleSigner;
 
@@ -138,11 +145,16 @@ pub async fn inspect_handler(
         }
         Err(e) => {
             error!(a = link_params.a, error = %e, "Inspect failed");
+            let client_msg = match &e {
+                gc_client::InspectError::Timeout => "Inspection timed out, please retry",
+                gc_client::InspectError::NoBots => "Service temporarily unavailable",
+                _ => "Inspection failed, please retry",
+            };
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(SingleResponse {
                     iteminfo: None,
-                    error: Some(e.to_string()),
+                    error: Some(client_msg.to_string()),
                     item_detail: None,
                     oracle_signature: None,
                 }),
@@ -160,15 +172,22 @@ pub async fn inspect_handler(
 pub async fn bulk_handler(
     State(state): State<Arc<InspectState>>,
     Json(body): Json<BulkRequest>,
-) -> Json<BulkResponse> {
+) -> Result<Json<BulkResponse>, (StatusCode, String)> {
     let total = body.links.len();
+    if total > MAX_BULK_ITEMS {
+        warn!(total, max = MAX_BULK_ITEMS, "Bulk request exceeds limit");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Too many items: {total} exceeds limit of {MAX_BULK_ITEMS}"),
+        ));
+    }
     info!(total, "Processing bulk inspect request");
 
     let mut response = BulkResponse::new();
     let mut cache_hits = 0u32;
 
     // Separate cache hits from misses.
-    let mut misses: Vec<&str> = Vec::new();
+    let mut misses: Vec<String> = Vec::new();
     for link_item in &body.links {
         let link = &link_item.link;
         if let Some(cached) = state.cache.get(link) {
@@ -194,7 +213,7 @@ pub async fn bulk_handler(
             );
             cache_hits += 1;
         } else {
-            misses.push(link);
+            misses.push(link.clone());
         }
     }
 
@@ -206,34 +225,38 @@ pub async fn bulk_handler(
         );
     }
 
-    // Inspect cache misses via bot pool.
+    // Inspect cache misses via bot pool (bounded concurrency).
     if !misses.is_empty() {
-        let futures: Vec<_> = misses
-            .iter()
-            .map(|link| {
-                let pool_ref = &state.pool;
-                let signer_ref = &state.signer;
-                let link = link.to_string();
-                async move {
-                    let params = match parse_inspect_link(&link) {
-                        Some(p) => p,
-                        None => return (link, None, Err("Invalid inspect link".to_string())),
-                    };
-                    let asset_id_num = params.a;
-                    let asset_id_key = params.a.to_string();
-                    match pool_ref.inspect(&params).await {
-                        Ok(data) => {
-                            let (item_detail, oracle_signature) =
-                                sign_inspect_data(signer_ref, asset_id_num, &data).await;
-                            (asset_id_key, Some(link), Ok((data, item_detail, oracle_signature)))
-                        }
-                        Err(e) => (asset_id_key, Some(link), Err(e.to_string())),
+        let results: Vec<_> = stream::iter(misses.into_iter().map(|link| {
+            let state = Arc::clone(&state);
+            async move {
+                let params = match parse_inspect_link(&link) {
+                    Some(p) => p,
+                    None => return (link, None, Err("Invalid inspect link".to_string())),
+                };
+                let asset_id_num = params.a;
+                let asset_id_key = params.a.to_string();
+                match state.pool.inspect(&params).await {
+                    Ok(data) => {
+                        let (item_detail, oracle_signature) =
+                            sign_inspect_data(&state.signer, asset_id_num, &data).await;
+                        (asset_id_key, Some(link), Ok((data, item_detail, oracle_signature)))
+                    }
+                    Err(e) => {
+                        error!(a = asset_id_num, error = %e, "Bulk inspect item failed");
+                        let msg = match &e {
+                            gc_client::InspectError::Timeout => "Inspection timed out",
+                            gc_client::InspectError::NoBots => "Service temporarily unavailable",
+                            _ => "Inspection failed",
+                        };
+                        (asset_id_key, Some(link), Err(msg.to_string()))
                     }
                 }
-            })
-            .collect();
-
-        let results = futures_util::future::join_all(futures).await;
+            }
+        }))
+        .buffer_unordered(BULK_CONCURRENCY)
+        .collect()
+        .await;
 
         for (key, link, result) in results {
             match result {
@@ -274,5 +297,5 @@ pub async fn bulk_handler(
         "Bulk inspect complete"
     );
 
-    Json(response)
+    Ok(Json(response))
 }
