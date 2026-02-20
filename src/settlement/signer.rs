@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::LazyLock;
 
 use alloy::primitives::{keccak256, Address, FixedBytes, B256};
@@ -38,21 +39,21 @@ impl OracleSigner {
     /// Create from OracleConfig.
     ///
     /// Key resolution order:
-    /// 1. Generate a fresh random key (TEE mode — key never leaves enclave)
-    /// 2. `ORACLE_SIGNING_KEY` env var (dev/test mode only — operator knows key)
-    /// 3. `signing_key_path` config (dev/test mode only)
+    /// 1. `ORACLE_SIGNING_KEY` env var (dev/test mode only — operator knows key)
+    /// 2. `signing_key_path` config (dev/test mode only)
+    /// 3. dstack `derive_key` (production — deterministic key bound to compose-hash)
+    /// 4. Fresh random key (fallback TEE mode — requires registerOracle() on every reboot)
     ///
-    /// In production SGX, always use the generated key. The key only exists in
-    /// encrypted enclave memory and is bound to the DCAP quote via reportData.
-    /// Each enclave boot produces a fresh key → requires `registerOracle()`.
-    pub fn from_config(config: &OracleConfig) -> Result<Self> {
+    /// In dstack production mode, the key is derived deterministically from the TEE
+    /// identity. Same Docker image = same key across reboots. Different image = different key.
+    pub async fn from_config(config: &OracleConfig) -> Result<Self> {
         let signer = if let Ok(hex_key) = std::env::var("ORACLE_SIGNING_KEY") {
-            // Dev/test mode: operator-provided key (NOT for production SGX)
+            // Dev/test mode: operator-provided key
             let hex_key = hex_key.trim();
             let s = hex_key
                 .parse::<PrivateKeySigner>()
                 .map_err(|e| eyre!("ORACLE_SIGNING_KEY invalid: {e}"))?;
-            info!("Oracle key loaded from env (dev/test mode — NOT SGX-secure)");
+            info!("Oracle key loaded from env (dev/test mode)");
             s
         } else if let Some(path) = &config.signing_key_path {
             // Dev/test mode: key from file
@@ -62,14 +63,17 @@ impl OracleSigner {
             let s = data
                 .parse::<PrivateKeySigner>()
                 .map_err(|e| eyre!("Invalid oracle key in '{path}': {e}"))?;
-            info!("Oracle key loaded from file (dev/test mode — NOT SGX-secure)");
+            info!("Oracle key loaded from file (dev/test mode)");
             s
+        } else if Path::new("/var/run/dstack.sock").exists() {
+            // dstack production mode: derive deterministic key from TEE identity
+            derive_key_from_dstack().await?
         } else {
-            // Production TEE mode: generate fresh key inside enclave
+            // Fallback TEE mode: fresh random key (requires registerOracle on each boot)
             let s = PrivateKeySigner::random();
             info!(
-                "Oracle key generated inside enclave (address={}). \
-                 Key exists only in enclave memory — register via /attestation quote.",
+                "Oracle key generated randomly (address={}). \
+                 Register via /attestation quote.",
                 s.address()
             );
             s
@@ -209,6 +213,43 @@ fn compute_item_attestation_struct_hash(asset_id: u64, item_detail: u64) -> B256
     encoded.extend_from_slice(&FixedBytes::<32>::left_padding_from(&item_detail.to_be_bytes()).0);
 
     keccak256(&encoded)
+}
+
+/// Derive a deterministic oracle signing key from dstack TEE identity.
+///
+/// Uses dstack's `derive_key` API which produces a key bound to the compose-hash.
+/// Same Docker image = same key. Different image = different key.
+/// The raw P-256 private key bytes (32 bytes) are used as a secp256k1 private key.
+async fn derive_key_from_dstack() -> Result<PrivateKeySigner> {
+    use dstack_sdk::tappd_client::TappdClient;
+
+    let client = TappdClient::new(None);
+    let resp = client
+        .derive_key("oracle/signing/v1")
+        .await
+        .map_err(|e| eyre!("dstack derive_key failed: {e}"))?;
+
+    let key_bytes = resp
+        .decode_key()
+        .map_err(|e| eyre!("Failed to decode dstack derived key: {e}"))?;
+
+    if key_bytes.len() < 32 {
+        return Err(eyre!(
+            "dstack derived key too short ({} bytes, need 32)",
+            key_bytes.len()
+        ));
+    }
+
+    let key = B256::from_slice(&key_bytes[..32]);
+    let signer = PrivateKeySigner::from_bytes(&key)
+        .map_err(|e| eyre!("Invalid secp256k1 key from dstack derivation: {e}"))?;
+
+    info!(
+        "Oracle key derived via dstack (address={}). \
+         Deterministic — survives reboots, changes on image update.",
+        signer.address()
+    );
+    Ok(signer)
 }
 
 /// Compute EIP-712 digest: keccak256("\x19\x01" || domainSeparator || structHash)

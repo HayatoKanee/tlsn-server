@@ -146,7 +146,7 @@ async fn main() -> eyre::Result<()> {
     }
 
     // Initialize oracle signer (required — single verifier path).
-    let oracle_signer = OracleSigner::from_config(&config.oracle)?;
+    let oracle_signer = OracleSigner::from_config(&config.oracle).await?;
     info!("Oracle signer: address={}", oracle_signer.address());
 
     // Initialize chain reader for on-chain escrow reads.
@@ -291,14 +291,14 @@ async fn health_handler() -> impl IntoResponse {
 /// GET /info — server version and oracle address.
 async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let git_hash = std::env::var("GIT_HASH").unwrap_or_else(|_| "dev".to_string());
-    let backend = attestation::detect_tdx_backend();
+    let tdx_available = attestation::is_tdx_available();
 
     Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION"),
         git_hash,
         oracle_address: format!("{}", state.oracle_signer.address()),
-        tdx_enabled: attestation::is_tdx_available(),
-        tdx_backend: format!("{:?}", backend),
+        tdx_enabled: tdx_available,
+        tdx_backend: if tdx_available { "Dstack".to_string() } else { "None".to_string() },
     })
 }
 

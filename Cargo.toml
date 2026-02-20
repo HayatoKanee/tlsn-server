@@ -70,8 +70,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1.0", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 
-# System (ioctl for TDX guest device — Azure IMDS fallback)
-libc = "0.2"
+# dstack TEE SDK (TDX attestation + key derivation via /var/run/dstack.sock)
+dstack-sdk = "0.1"
 
 # Steam CS2 inspect (Game Coordinator protocol)
 steam-vent = { version = "0.4", features = ["csgo"] }

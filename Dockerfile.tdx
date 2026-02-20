@@ -1,14 +1,10 @@
-# TDX oracle build — no Gramine, no SGX devices, near-native performance.
+# dstack TDX oracle image.
 #
 # Build:
 #   docker build -f Dockerfile.tdx -t tlsn-server-tdx .
 #
-# Run (requires TDX VM with configfs or /dev/tdx_guest):
-#   docker run -d -p 7047:7047 \
-#     --device /dev/tdx_guest \
-#     -v /sys/kernel/config:/sys/kernel/config \
-#     -v /path/to/bots.json:/app/bots.json:ro \
-#     tlsn-server-tdx
+# Deploy via dstack with docker-compose.yaml (see docker-compose.yaml).
+# dstack provides /var/run/dstack.sock for attestation + key derivation.
 #
 # Secrets (bots.json) are mounted at runtime, NEVER baked into the image.
 

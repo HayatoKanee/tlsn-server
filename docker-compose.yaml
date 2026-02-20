@@ -1,0 +1,18 @@
+# dstack compose file for TDX oracle deployment.
+#
+# The SHA256 of this file becomes the compose-hash, extended into RTMR[3].
+# Any change to this file (including image digest) produces a different RTMR[3],
+# which must be registered on-chain via setRtmr3().
+#
+# bots.json is runtime-mounted (NOT part of measurement).
+# config.yaml is baked into the image (IS part of measurement).
+
+services:
+  oracle:
+    image: ghcr.io/jjskin/tlsn-server@sha256:REPLACE_WITH_PINNED_DIGEST
+    ports:
+      - "7047:7047"
+    volumes:
+      - ./bots.json:/app/bots.json:ro
+    environment:
+      - RUST_LOG=info
