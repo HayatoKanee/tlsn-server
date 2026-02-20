@@ -190,7 +190,11 @@ pub async fn handle_post_protocol<S: AsyncRead + AsyncWrite + Unpin>(
     );
 
     let t_decide = Instant::now();
-    let settlement = oracle::decide(&server_name_str, &mpc.sent_bytes, &mpc.recv_bytes, escrow)
+    let proof_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs();
+    let settlement = oracle::decide(&server_name_str, &mpc.sent_bytes, &mpc.recv_bytes, escrow, proof_timestamp)
         .map_err(|e| eyre!("Settlement decision failed: {e}"))?;
     info!("[TIMING] oracle::decide: {:?}", t_decide.elapsed());
 
