@@ -18,6 +18,14 @@
 *.pem
 *.key
 
+# Local config (credentials, proxies)
+bots.json
+bots-local.json
+config-local.yaml
+
+# Generated docs
+docs/
+
 # Tooling
 .serena/
 CLAUDE.md
