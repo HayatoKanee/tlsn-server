@@ -1,83 +1,138 @@
-# tlsn-server
+# jjskin-oracle
 
-A standalone [TLSNotary](https://tlsnotary.org/) Notary Server for **alpha 14**.
+TDX oracle for the [JJSKIN](https://jjskin.com) CS2 skin marketplace. Runs MPC-TLS verification and settlement decisions inside an Intel TDX confidential VM, so neither the operator nor the hosting provider can tamper with trade outcomes.
 
-Built on [tlsnotary/tlsn](https://github.com/tlsnotary/tlsn) `v0.1.0-alpha.14`.
+Built on [TLSNotary](https://github.com/tlsnotary/tlsn) `v0.1.0-alpha.14` and deployed via [dstack](https://github.com/aspect-build/dstack) (Phala Network).
 
-TLSNotary removed the `notary-server` crate in alpha 13 and archived `tlsn-js`. This project provides a lightweight notary server that implements the MPC-TLS co-computation and attestation signing protocol.
+## How it works
 
-## What it does
+1. **MPC-TLS** — The oracle co-computes the TLS session with the prover (browser extension). Neither party sees the other's share of the key material.
+2. **Settlement** — After the TLS session, the oracle parses the authenticated Steam API response and decides Release or Refund based on trade state.
+3. **EIP-712 signing** — The decision is signed with the oracle's Ethereum key. Anyone can submit it on-chain.
+4. **TDX attestation** — The entire binary runs inside Intel TDX. A DCAP quote proves the exact code (MRTD) and Docker image (RTMR[3]) that produced the signature.
 
-1. **MPC-TLS co-computation** — participates in the TLS handshake as the verifier (MPC counterparty)
-2. **Attestation signing** — signs transcript commitments with a secp256k1 key, producing a portable `Attestation`
-3. The prover then builds a `Presentation` from `Attestation + Secrets` — this is the serializable proof
-
-## Protocol Flow
+## Modules
 
 ```
-Prover (WASM/Extension)              Notary Server
-─────────────────────                ────────────────
-1. POST /session                   → Create session, return sessionId
-2. WS /notarize?sessionId=xxx      → WebSocket upgrade
-3. MPC-TLS protocol                ←→ Verifier protocol (commit → accept → run → verify)
-4. Send AttestationRequest         → Receive over reclaimed socket
-5. Receive signed Attestation      ← Sign with secp256k1 key, send back
-```
-
-## Quick Start
-
-```bash
-# Build
-cargo build --release
-
-# Run with default config (ephemeral signing key)
-./target/release/tlsn-server
-
-# Run with custom config
-./target/release/tlsn-server --config config.yaml
+src/
+  main.rs                  Axum server, routes, session lifecycle
+  config.rs                YAML + env configuration
+  verifier.rs              MPC-TLS protocol + post-protocol settlement
+  attestation.rs           TDX DCAP quote generation via dstack
+  proxy.rs                 WebSocket-to-TCP proxy for browser clients
+  settlement/
+    oracle.rs              Core decision engine (3 proof paths)
+    parsing.rs             HTTP/JSON/HTML parsing for Steam responses
+    types.rs               EscrowSnapshot, Decision, RefundReason, Settlement
+    decision.rs            Fault attribution (expired, canceled, declined)
+    signer.rs              EIP-712 typed-data signing
+    chain_reader.rs        On-chain escrow reads (Arbitrum)
+  inspect/
+    bot_pool.rs            Steam bot pool with proxy rotation
+    gc_client.rs           CS2 Game Coordinator protocol client
+    cache.rs               In-memory inspect result cache
+    link_parser.rs         Steam inspect link parser (S/M/A/D params)
+    item_detail.rs         Protobuf encoding for item details
+    types.rs               Inspect request/response types
 ```
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check (returns "ok") |
-| GET | `/info` | Server version + notary public key |
-| POST | `/session` | Create a notarization session |
-| GET | `/notarize?sessionId=xxx` | WebSocket for notarization |
-| GET | `/proxy?token=host:port` | WebSocket-to-TCP proxy (for browser clients) |
+| GET | `/health` | Health check (`"ok"`) |
+| GET | `/info` | Version, oracle address, TDX status |
+| GET | `/attestation` | Fresh TDX DCAP quote (binary) |
+| POST | `/session` | Create MPC-TLS session (requires `assetId` query param) |
+| GET | `/notarize` | WebSocket MPC-TLS session |
+| GET | `/proxy` | WebSocket-to-TCP proxy for browser provers |
+| GET | `/inspect` | CS2 item inspection (float, paint seed, stickers) |
+| POST | `/inspect/bulk` | Bulk inspection (up to 100 items) |
 
-### POST /session
+## Settlement decision logic
 
-Request:
-```json
-{
-  "maxSentData": 4096,
-  "maxRecvData": 16384
-}
+Three proof paths, each targeting a different Steam endpoint:
+
+| Proof source | Endpoint verified | Can Release? | Can Refund? |
+|---|---|---|---|
+| `GetTradeOffer` | `api.steampowered.com/IEconService/GetTradeOffer` | No | Yes (expired, canceled, declined) |
+| `GetTradeStatus` | `api.steampowered.com/IEconService/GetTradeStatus` | Yes (status 3 + escrow passed) | Yes (status 4-12 rollback) |
+| `Community HTML` | `steamcommunity.com/tradeoffer/<id>` | No | Yes (trade abandonment, 24h wait) |
+
+## Docker image
+
+The production image is published to Docker Hub:
+
+```
+lumio1/jjskin-oracle
 ```
 
-Response:
-```json
-{
-  "sessionId": "uuid-v4"
-}
+The `docker-compose.yaml` in this repo pins the image by SHA256 digest. dstack hashes this file into RTMR[3], binding the exact image to the TDX attestation.
+
+### Build from source
+
+```bash
+docker build -t jjskin-oracle .
 ```
 
-### GET /info
+### Run locally (no TDX)
 
-Response:
-```json
-{
-  "version": "0.1.0",
-  "publicKey": "hex-encoded-secp256k1-pubkey",
-  "gitHash": "dev"
-}
+```bash
+docker run -p 7047:7047 jjskin-oracle
+```
+
+The `/attestation` endpoint returns 503 outside TDX. All other endpoints work normally.
+
+## Verify the oracle
+
+Anyone can verify that the oracle is running the expected code inside TDX:
+
+### 1. Get the attestation quote
+
+```bash
+curl -s https://<oracle-host>:7047/attestation -o quote.bin
+```
+
+### 2. Extract measurements
+
+```python
+with open('quote.bin', 'rb') as f:
+    data = f.read()
+
+# TDX Quote v4, TD Report Body v1.5
+mrtd = data[184:232]           # 48 bytes — hash of the TD (binary measurement)
+rtmr3 = data[520:568]          # 48 bytes — dstack compose-hash extension
+oracle_addr = data[568:588]    # 20 bytes — oracle's Ethereum address
+
+print(f'MRTD:    {mrtd.hex()}')
+print(f'RTMR[3]: {rtmr3.hex()}')
+print(f'Oracle:  0x{oracle_addr.hex()}')
+```
+
+### 3. Verify RTMR[3] matches docker-compose.yaml
+
+```bash
+# The compose-hash is SHA256(docker-compose.yaml)
+sha256sum docker-compose.yaml
+
+# dstack extends RTMR[3] with this hash at boot.
+# The on-chain verifier checks: keccak256(RTMR3_48_bytes)
+```
+
+### 4. Verify on-chain
+
+The JJSKIN smart contract verifies the DCAP quote via Automata's on-chain verifier and checks:
+
+- **MRTD** matches the registered measurement (`keccak256(mrtd_48_bytes)`)
+- **RTMR[3]** matches the registered compose-hash (`keccak256(rtmr3_48_bytes)`)
+- **reportData[0:20]** is the oracle's Ethereum address (registered as authorized signer)
+
+```bash
+# Check if an oracle is registered
+cast call <JJSKIN_ADDRESS> "oracles(address)(bool)" <ORACLE_ADDRESS> --rpc-url <RPC>
 ```
 
 ## Configuration
-
-See `config.yaml`:
 
 ```yaml
 host: "0.0.0.0"
@@ -87,97 +142,24 @@ notarization:
   max_sent_data: 4096
   max_recv_data: 16384
   timeout: 120
-  private_key_pem_path: null  # null = ephemeral key
 
-tls:
-  enabled: false
+oracle:
+  contract_address: "0x..."
+  chain_id: 421614
+  rpc_url: "https://sepolia-rollup.arbitrum.io/rpc"
+
+inspect:
+  bots_config_path: "bots.json"
+  cache_ttl_secs: 300
 ```
 
-## Docker
+The oracle signing key is derived deterministically inside dstack using `TappdClient::derive_key()`, so no private key is stored or configured.
 
-### Pre-built image (Docker Hub)
+## Build & test
 
 ```bash
-docker pull lumio1/tlsn-server:v0.1.0-alpha.14
-docker run -p 7047:7047 lumio1/tlsn-server:v0.1.0-alpha.14
-```
-
-With a custom config:
-
-```bash
-docker run -p 7047:7047 \
-  -v $(pwd)/config.yaml:/app/config.yaml \
-  lumio1/tlsn-server:v0.1.0-alpha.14 \
-  --config /app/config.yaml
-```
-
-With a persistent signing key:
-
-```bash
-docker run -p 7047:7047 \
-  -v $(pwd)/notary.pem:/app/notary.pem \
-  -v $(pwd)/config.yaml:/app/config.yaml \
-  lumio1/tlsn-server:v0.1.0-alpha.14 \
-  --config /app/config.yaml
-```
-
-### Build from source
-
-```bash
-docker build -t tlsn-server .
-docker run -p 7047:7047 tlsn-server
-```
-
-## Signing Key
-
-By default, an ephemeral secp256k1 key is generated on startup. For production, provide a persistent key using one of these methods (checked in order):
-
-### Option 1: Environment variable (recommended for containers)
-
-```bash
-# Generate a raw hex private key
-openssl ecparam -name secp256k1 -genkey -noout | openssl ec -text -noout 2>/dev/null | grep -A3 'priv:' | tail -3 | tr -d ' :\n'
-
-# Pass it as NOTARY_SIGNING_KEY
-docker run -p 7047:7047 -e NOTARY_SIGNING_KEY=<64-char-hex> lumio1/tlsn-server:v0.1.0-alpha.14
-```
-
-### Option 2: PEM file
-
-```bash
-# Generate a PKCS8 PEM key
-openssl ecparam -name secp256k1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out notary.pem
-
-# Reference it in config.yaml
-# notarization.private_key_pem_path: "/path/to/notary.pem"
-```
-
-### Option 3: Raw hex file
-
-Save a 64-character hex private key to a file and reference it via `private_key_pem_path` in config.
-
-The public key is exposed via `/info` for provers to verify attestations.
-
-## Testing
-
-```bash
-cargo test -- --nocapture
-```
-
-The integration test runs a full MPC-TLS notarization round-trip using the official `tlsn-server-fixture` (self-signed TLS server from the tlsn repo). It validates that the notary correctly participates in the protocol, signs attestations, and produces output that the prover can verify.
-
-## Architecture
-
-```
-src/
-├── main.rs      # Axum server, routes, session management
-├── notary.rs    # Core notarization (MPC-TLS + attestation signing)
-├── signing.rs   # secp256k1 key management
-├── proxy.rs     # WebSocket-to-TCP proxy for browser clients
-├── config.rs    # YAML configuration
-└── lib.rs       # Library exports for integration tests
-tests/
-└── notarize_integration.rs  # Full round-trip integration test
+cargo build --release
+cargo test
 ```
 
 ## License

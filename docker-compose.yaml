@@ -9,7 +9,7 @@
 
 services:
   oracle:
-    image: lumio1/jjskin-oracle@sha256:5ca5b40c3c3d01792e5ab539c6588e8cb6ec52ff99322121a77df707d3afac96
+    image: lumio1/jjskin-oracle@sha256:6d53bdd35eaf3e25a8b45ad1111f2291a536947a586961c2ea5be745506bc296
     ports:
       - "7047:7047"
     volumes:
