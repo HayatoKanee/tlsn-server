@@ -9,10 +9,11 @@
 
 services:
   oracle:
-    image: ghcr.io/jjskin/tlsn-server@sha256:REPLACE_WITH_PINNED_DIGEST
+    image: lumio1/jjskin-oracle@sha256:5ca5b40c3c3d01792e5ab539c6588e8cb6ec52ff99322121a77df707d3afac96
     ports:
       - "7047:7047"
     volumes:
-      - ./bots.json:/app/bots.json:ro
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
+      - /var/run/tappd.sock:/var/run/tappd.sock:ro
     environment:
       - RUST_LOG=info

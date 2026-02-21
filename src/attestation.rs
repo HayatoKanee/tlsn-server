@@ -20,12 +20,13 @@ use tracing::{error, info, warn};
 /// Oracle address bound at startup, embedded in every generated quote.
 static ORACLE_ADDRESS: OnceLock<Address> = OnceLock::new();
 
-/// dstack socket path (present inside dstack CVMs).
+/// dstack socket paths (present inside dstack CVMs).
 const DSTACK_SOCKET: &str = "/var/run/dstack.sock";
+const TAPPD_SOCKET: &str = "/var/run/tappd.sock";
 
 /// Check if running inside a dstack CVM.
 pub fn is_tdx_available() -> bool {
-    Path::new(DSTACK_SOCKET).exists()
+    Path::new(DSTACK_SOCKET).exists() || Path::new(TAPPD_SOCKET).exists()
 }
 
 /// Store the oracle's Ethereum address for attestation quote generation.

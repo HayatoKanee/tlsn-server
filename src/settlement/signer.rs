@@ -65,7 +65,9 @@ impl OracleSigner {
                 .map_err(|e| eyre!("Invalid oracle key in '{path}': {e}"))?;
             info!("Oracle key loaded from file (dev/test mode)");
             s
-        } else if Path::new("/var/run/dstack.sock").exists() {
+        } else if Path::new("/var/run/dstack.sock").exists()
+            || Path::new("/var/run/tappd.sock").exists()
+        {
             // dstack production mode: derive deterministic key from TEE identity
             derive_key_from_dstack().await?
         } else {
